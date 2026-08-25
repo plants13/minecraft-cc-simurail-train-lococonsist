@@ -41,7 +41,7 @@ Minecraft **CC:Tweaked** 物理化列车（**Simurail** 物理转向架）重联
 1. 每台车 `label set <自己的名字>`（与 mu_config 的键对应）
 2. 复制 `locos/` 三个文件到每台车
 3. 每台车按自己视角改 `mu_config.lua`（协议组一致、others 列对方）和 `config_locomodel.lua`（接线面）
-4. 接线：手柄（sideSetSpeed）、模式拉杆（sideReverse）、红灯（sideRedSignal）三个输入面 + 显示器 + 无线 modem；转向架外设有线网络可达；**变速箱接常亮红石供转速**
+4. 接线：手柄（sideSetSpeed）、模式拉杆（sideReverse）、红灯（sideRedSignal）三个输入面 + 显示器 + 无线 modem；转向架外设有线网络可达
 5. 想当主机的车拉杆扳到前进/后退，其余中立，开机即运行
 
 ## 操作速查
