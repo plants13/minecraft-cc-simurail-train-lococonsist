@@ -3,20 +3,17 @@
 -- Edit this file to change locomotive parameters
 
 return {
-    -- Maximum operating speed (m/s)
-    -- Maps redstone signal 15 -> this speed, signal 0 -> 0 (stop)
+    -- ---- Maximum operating speed (m/s) ----
     maxSpeed = 50.0,
 
-    -- ---- Redstone I/O sides ----
-    -- INPUT sides
+    -- ---- Input sides ----
     sideSetSpeed  = "top",    -- analog INPUT:  speed setpoint (0-15)
     sideReverse   = "right",  -- analog INPUT: mode lever 0-4 fwd / 5-10 neutral / 11-15 rev
-    sideRedSignal = "front",  -- analog INPUT: red signal ahead (0=clear, 1-15=red, higher=closer)
 
-    -- OUTPUT / peripheral (bogey mode drives via the Simurail CC peripheral,
-    -- so the legacy redstone output sides are omitted. sideThrottle used to
-    -- feed the gearbox RPM: if you remove it, feed the gearbox from a
-    -- constant redstone source instead or the train will not drive).
+    -- OUTPUT / peripheral (drive, brake and direction all go to the Simurail
+    -- CC peripheral; the legacy redstone output sides are gone for good).
+    -- sideThrottle used to feed the gearbox RPM: feed the gearbox from a
+    -- constant redstone source (torch/lever) or the train will not drive.
     sideMonitor   = "left",   -- monitor peripheral side
     sideModem     = "front",  -- wireless modem side (rednet)
 
@@ -24,6 +21,26 @@ return {
     -- Toggled at runtime with the "VisualDriving" command (case-insensitive).
     -- Caps the set speed at visualMaxSpeed and allows passing red signals.
     visualMaxSpeed = 10.0,   -- m/s (= 36 km/h)
+
+    -- ---- Red-signal protection (Simurail bogey probe) ----
+    -- The bogey probe reports the distance (blocks, measured along the track)
+    -- to the nearest signal boundary that is RED FOR US: forced red, or its
+    -- block occupied by a consist group other than ours. There is NO approach
+    -- braking: the train drives normally until the red is inside
+    -- redEbDistance blocks, which means the axle has effectively reached the
+    -- signal -> EB latch (full brake, set speed zero, cleared by pulling the
+    -- RHI handle to EB).
+    -- Which axle the probe is read from is FIXED (not travel-relative):
+    --   true/nil  = bogey front axle (axleFront)   <- default
+    --   false     = bogey back axle  (axleBack)
+    -- The axle looks out of ITS OWN end of the bogey, so this must be the end
+    -- that points in the direction of travel. If the protection trips for a
+    -- signal behind the train (or ignores one ahead), flip this flag.
+    -- Verify with `lua bogey_probe.lua`, which prints both axles' probe data
+    -- and track direction vectors.
+    redProbeFront    = true,   -- true = front axle (default)
+    redProbeWindow   = 128.0,  -- blocks: probe scan length forced onto every bogey
+    redEbDistance    = 4.0,    -- blocks: red closer than this -> EB latch
 
     -- ---- Control loop interval (s) ----
     -- Loop cadence (the rednet.receive timeout drives it). 0.05 s = 20 Hz,
@@ -33,8 +50,8 @@ return {
     pidDt = 0.05,
 
     -- ---- Unified PID (single controller for both throttle and brake) ----
-    -- Positive output [0,15]  -> throttle (drive)
-    -- Negative output [-15,0] -> brake    (decelerate)
+    -- Positive output [0,128] -> drive stress (throttle)
+    -- Negative output         -> brake strength (0..1) (decelerate)
     -- This prevents throttle/brake fighting and eliminates oscillation at setpoint.
 
     -- Unified PID output is in drive-stress units 0..128 (bogey setMaxStress)
@@ -42,8 +59,11 @@ return {
     -- rescaled from the old 0..15 scale by x8.533 (128/15) - keep the ratio.
     pidKi = 4.3,                   -- integral (0..128 scale; old 0.5 x8.53)
     pidKd = 4.3,                   -- derivative (0..128 scale; old 0.5 x8.53)
-    pidKpNear = 6.8, pidKpMid = 10.2, pidKpFar = 21.3,   -- gain zones (0..128 scale)
-    pidKpFar  = 2.5,    -- Kp when error is large  (aggressive catch-up)
+    -- Gain zones (0..128 scale). The far gain is deliberately the most
+    -- aggressive one: a large speed error must command a large drive stress.
+    -- (A duplicate pidKpFar = 2.5 line used to override the 21.3 below,
+    -- left over from the old 0..15 scale - do not reintroduce it.)
+    pidKpNear = 6.8, pidKpMid = 10.2, pidKpFar = 21.3,
     nearThreshold = 0.8, -- m/s: boundary between near and mid zones
     farThreshold  = 5.0, -- m/s: boundary between mid and far zones
 
@@ -62,7 +82,7 @@ return {
 
     -- ---- Output ramp (smooth transitions) ----
     -- In constant-speed mode (C / K1..K4), throttle and brake outputs ramp toward
-    -- the PID target at most this many units (0-15 scale) per loop tick.
+    -- the PID target at most this many stress units (0..128 scale) per 0.1 s.
     -- Lower -> smoother but slower force changes. Higher -> snappier.
     -- EB / B / N modes switch instantly (not ramped).
     maxOutputDelta = 17.0,         -- stress change limit per 0.1s (0..128 scale; old 2.0 x8.53, full sweep ~0.75s)
@@ -78,21 +98,28 @@ return {
     emergencyBrakeKp = 0.1,        -- per m/s (0..1 brake scale; old 1.5 /15)
 
     -- ---- Performance calibration (runtime "Calibrate" / "calib" command) ----
-    -- Runs a full-throttle accel run, then a full-brake run from a cruise
-    -- speed, fits velocity samples to get real m/s^2 rates, saved to
-    -- calib.json on this computer for future automatic train control (LKJ).
-    calibAccelDur     = 3.0,   -- s: full-throttle accel measurement window
-    calibBrakeTarget  = 10.0,  -- m/s: cruise speed before the brake run (36 km/h)
-    calibRunTimeout   = 20.0,  -- s: max time to reach the brake-run cruise speed
-    calibBrakeTimeout = 12.0,  -- s: max time for the brake run (stops early if faster)
-    calibSettle       = 0.5,   -- s: output settle time before sampling starts
+    -- Profile: full throttle until the top speed is found - the speed stops
+    -- gaining more than calibPlateauEps for calibPlateauTime (it hovers around
+    -- a value) - or MAX_SPEED (maxSpeed above, the set-speed ceiling) is
+    -- reached, whichever is lower. Then it coasts briefly and brakes at
+    -- calibBrakeStrength down to a standstill. Velocity samples are fitted to
+    -- get real m/s^2 rates, saved to calib.json (also used by the red-signal
+    -- stop curve; the full-brake rate is extrapolated from the measured one).
+    calibAccelDur       = 3.0,   -- s: full-throttle accel measurement window
+    calibBrakeStrength  = 0.5,   -- brake strength used for the brake run (0.5 = 50%)
+    calibPlateauTime    = 2.0,   -- s without a speed gain -> top speed reached
+    calibPlateauEps     = 0.1,   -- m/s: a gain above this counts as progress
+    calibMinTopSpeed    = 5.0,   -- m/s: top speed below this -> run failed (18 km/h)
+    calibStartClearance = 64.0,  -- blocks: clear track (no red) needed to start
+    calibRunTimeout     = 120.0, -- s: safety net for the climb (plateau ends it)
+    calibBrakeTimeout   = 60.0,  -- s: floor for the brake run (scaled by top speed)
+    calibSettle         = 0.5,   -- s: output settle time before sampling starts
 
-    -- ---- Simurail bogey peripheral output (drive/brake via CC) ----
-    -- When enabled and a Simurail_PhysicsBogey peripheral is reachable
-    -- (attached or on a wired network), drive/brake/reverse are sent to the
-    -- bogey peripheral instead of the redstone output sides. The red signal
-    -- ahead always comes from sideRedSignal (the bogey probe path was tried
-    -- and removed). Falls back to the redstone sides if no bogey peripheral.
-    useBogeyPeripheral = true,   -- false = legacy redstone-only mode
-    bogeyDriveMax = 128.0,       -- drive stress range: throttle 0-15 maps to +/-128 (kinetic stress draw)
+    -- ---- Simurail bogey peripheral output (drive/brake/reverse via CC) ----
+    -- Mandatory: a Simurail_PhysicsBogey peripheral must be reachable
+    -- (attached directly or on a wired network). There is NO redstone output
+    -- fallback any more - drive, brake and direction all go to the bogey
+    -- peripheral. The red signal ahead comes from the bogey probe (see the
+    -- redProbe* settings above), not from a redstone input.
+    bogeyDriveMax = 128.0,       -- drive stress range: PID output 0..128 -> setMaxStress +/-128 (kinetic stress draw)
 }

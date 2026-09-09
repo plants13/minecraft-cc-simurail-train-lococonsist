@@ -27,9 +27,49 @@ print("  controlMode       : " .. tostring(bogey.getControlMode()))
 print("  maxStress         : " .. tostring(bogey.getMaxStress()))
 print("  stressMultiplier  : " .. tostring(bogey.getStressMultiplier()))
 print("  brakeStrength     : " .. tostring(bogey.getBrakeStrength()))
-print("  probeDistance     : " .. tostring(bogey.getProbeDistance()))
+print("  probeDistance     : " .. tostring(bogey.getProbeDistance()) .. "   (0 = probe disabled)")
 print("  occupiedSignal(f) : " .. tostring(bogey.getProbeOccupiedSignalDistance(true)))
 print("  occupiedSignal(b) : " .. tostring(bogey.getProbeOccupiedSignalDistance(false)))
+
+-- Probe snapshot for the axle the locomotive protects with (front axle).
+-- Distances are blocks along the track; -1 means "nothing found in the window".
+local function probeAxle(front)
+    local tag = front and "front" or "back "
+    print("--- probe " .. tag .. " axle ---")
+    local function p(label, method, ...)
+        local ok, r = pcall(bogey[method], ...)
+        if not ok then
+            print(string.format("  %-24s: ERR %s", label, tostring(r)))
+        elseif type(r) == "table" then
+            local parts = {}
+            for i = 1, #r do parts[i] = tostring(r[i]) end
+            print(string.format("  %-24s: {%s}", label, table.concat(parts, ",")))
+        else
+            print(string.format("  %-24s: %s", label, tostring(r)))
+        end
+    end
+    p("occupiedSignalDist", "getProbeOccupiedSignalDistance", front)
+    p("occupiedSignalNames", "getProbeOccupiedSignalNames", front)
+    p("occupiedSignalAligned", "getProbeOccupiedSignalAligned", front)
+    p("occupiedSignalForced", "getProbeOccupiedSignalForced", front)
+    p("signalDistance", "getProbeSignalDistance", front)
+    p("signalNames", "getProbeSignalNames", front)
+    p("signalAligned", "getProbeSignalAligned", front)
+    p("stationDistance", "getProbeStationDistance", front)
+    p("stationName", "getProbeStationName", front)
+    p("discontinuityDist", "getProbeDiscontinuityDistance", front)
+    p("trackDir", "getTrackDir", front)
+end
+probeAxle(true)
+probeAxle(false)
+
+-- Which axle points the way the train travels: compare the two trackDir
+-- vectors with the direction the train is about to move. The axle whose
+-- vector matches that direction is the one redProbeFront must select.
+print()
+print("trackDir above = the direction each axle probes toward.")
+print("Pick the axle whose trackDir matches the travel direction and set")
+print("redProbeFront accordingly (true = front axle, false = back axle).")
 
 -- Read all probe methods available (guard against missing methods)
 local function probePrint(method, ...)

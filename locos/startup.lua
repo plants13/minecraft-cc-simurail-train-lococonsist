@@ -19,68 +19,259 @@ local MAX_SPEED       = cfg.maxSpeed
 local SIDE_SETSPEED   = cfg.sideSetSpeed
 local SIDE_REVERSE    = cfg.sideReverse
 local SIDE_MONITOR    = cfg.sideMonitor
-local SIDE_BRAKE      = cfg.sideBrake       -- optional in bogey mode (failback)
-local SIDE_THROTTLE   = cfg.sideThrottle    -- optional: gearbox RPM feed in bogey mode
-local SIDE_REVGEARBOX = cfg.sideRevGearbox  -- optional (legacy mode only)
-local SIDE_RED        = cfg.sideRedSignal or "front"   -- red signal ahead (default: front)
 local SIDE_MODEM      = cfg.sideModem or "front"       -- wireless modem side (rednet)
 local VISUAL_MAX      = cfg.visualMaxSpeed or 10.0     -- visual driving speed cap (m/s, 36 km/h)
 local CALIB_ACCEL_DUR    = cfg.calibAccelDur     or 3.0   -- s: accel measurement window
-local CALIB_BRAKE_TARGET = cfg.calibBrakeTarget  or 10.0  -- m/s: cruise speed before brake run
-local CALIB_RUN_TIMEOUT  = cfg.calibRunTimeout   or 20.0  -- s: max time to reach cruise speed
-local CALIB_BRAKE_TIMEOUT = cfg.calibBrakeTimeout or 12.0 -- s: max time for the brake run
+local CALIB_BRAKE_STR    = math.max(0.05, math.min(1, cfg.calibBrakeStrength or 0.5))  -- brake run strength
+local CALIB_PLATEAU_TIME = cfg.calibPlateauTime  or 2.0   -- s without a speed gain -> top speed
+local CALIB_PLATEAU_EPS  = cfg.calibPlateauEps   or 0.1   -- m/s: a gain above this counts as progress
+local CALIB_MIN_TOP      = cfg.calibMinTopSpeed  or 5.0   -- m/s: below this the run has failed
+local CALIB_START_CLEAR  = cfg.calibStartClearance or 64.0 -- blocks: clear track needed to start
+local CALIB_RUN_TIMEOUT  = cfg.calibRunTimeout   or 120.0 -- s: safety net for the climb
+local CALIB_BRAKE_TIMEOUT = cfg.calibBrakeTimeout or 60.0 -- s: floor for the brake run (scaled by top speed)
+local CALIB_BRAKE_MIN_DECEL = 0.2  -- m/s^2: slowest plausible decel, used to scale the brake timeout
 local CALIB_SETTLE       = cfg.calibSettle       or 0.5   -- s: output settle before sampling
 local CALIB_STOP         = 0.3   -- m/s: treated as stopped
 local CALIB_FILE         = "calib.json"
 
 -- ============================================================
--- 0b. Simurail physics bogey peripheral (drive/brake/signal via CC)
+-- 0b. Simurail physics bogey peripheral (drive/brake/direction via CC)
 -- ============================================================
--- If useBogeyPeripheral is enabled and a Simurail_PhysicsBogey peripheral is
--- reachable (attached or on a wired/wireless network), drive/brake/reverse
--- are sent to the bogey peripheral instead of the redstone output sides.
--- The red signal ahead ALWAYS comes from the sideRedSignal redstone input:
--- the bogey probe path was tried and removed (not reliably readable).
--- The redstone sides remain as failback.
-local USE_BOGEY     = cfg.useBogeyPeripheral ~= false
+-- Drive, brake and direction are sent to every reachable
+-- Simurail_PhysicsBogey peripheral (attached directly or on a wired/wireless
+-- network). This is the ONLY output channel: there is no redstone fallback.
+-- The red signal ahead comes from the bogey probe (section 0c), not from a
+-- redstone input.
 local DRIVE_STRESS_MAX = cfg.bogeyDriveMax or 128   -- drive stress range +/-128
-local bogey         = nil
+local bogeys        = {}     -- all reachable Simurail_PhysicsBogey peripherals
 local bCallWarned   = false
-local lastSentStress = -1   -- last drive stress sent to the bogey (change-only)
-local lastSentBrake  = -1   -- last brake strength sent to the bogey (change-only)
+local lastSentStress = {}   -- per-bogey: last SIGNED drive stress sent (change-only)
+local lastSentBrake  = {}   -- per-bogey: last brake strength sent (change-only)
 
-if USE_BOGEY then
-    local found = 0
-    for _, name in ipairs(peripheral.getNames()) do
-        if peripheral.getType(name) == "Simurail_PhysicsBogey" then
-            local p = peripheral.wrap(name)
-            if not bogey then bogey = p end
-            found = found + 1
-            -- Drive stress is controlled via setMaxStress (+/-128), which
-            -- directly reflects the kinetic stress draw. Lock the stress
-            -- multiplier at 1 so drive stress == |maxStress| exactly: a
-            -- leftover multiplier override or a STRENGTH control-mode redstone
-            -- input would otherwise scale it behind our back.
-            pcall(p.setStressMultiplierOverride, 1)
-        end
+for _, name in ipairs(peripheral.getNames()) do
+    if peripheral.getType(name) == "Simurail_PhysicsBogey" then
+        local p = peripheral.wrap(name)
+        bogeys[#bogeys + 1] = p
+        -- Drive stress is controlled via setMaxStress (+/-128), which
+        -- directly reflects the kinetic stress draw. Lock the stress
+        -- multiplier at 1 so drive stress == |maxStress| exactly: a
+        -- leftover multiplier override or a STRENGTH control-mode redstone
+        -- input would otherwise scale it behind our back.
+        pcall(p.setStressMultiplierOverride, 1)
     end
-    if found > 0 then
-        print("Bogey peripherals found: " .. found)
-    else
-        print("WARNING: useBogeyPeripheral=true but no Simurail_PhysicsBogey found - falling back to redstone sides")
+end
+if #bogeys > 0 then
+    print("Bogey peripherals found: " .. #bogeys)
+else
+    print("ERROR: no Simurail_PhysicsBogey peripheral - this vehicle cannot drive or brake")
+    print("       (check the wired network / that the bogey block is loaded)")
+end
+
+-- ============================================================
+-- 0c. Red-signal protection source (bogey probe, fixed axle)
+-- ============================================================
+-- The Simurail bogey probe walks the track graph ahead of an axle and caches
+-- the nearest signal boundary that is red for us (forced red, or its block
+-- occupied by a consist group other than ours). getProbe* returns the last
+-- scan, so:
+--   * the probe window MUST be > 0 - the mod default is 0 (disabled), which
+--     is why an earlier attempt at using the probe saw nothing; we force the
+--     configured window onto every bogey at startup,
+--   * data refreshes on the server every bogeyProbeInterval ticks
+--     (default 5 ticks = 0.25 s, so ~14 blocks of travel at 50 m/s).
+-- Only the FIRST occupied boundary in the window is reported, and a boundary
+-- whose signal faces the other way is ignored (we cannot see past it).
+--
+-- Protection rule: NO approach braking. The train drives normally until the
+-- red is inside RED_EB_DIST blocks, which means the axle has effectively
+-- reached the signal -> EB latch.
+local RED_PROBE_FRONT = cfg.redProbeFront ~= false   -- true/nil = front axle (default), false = back
+local RED_WINDOW      = cfg.redProbeWindow or 128.0  -- blocks
+local RED_EB_DIST     = cfg.redEbDistance or 4.0     -- blocks: trip inside this
+
+-- Force the scan window on every bogey (0 = probe disabled in the mod).
+for _, p in ipairs(bogeys) do
+    local ok, cur = pcall(p.getProbeDistance)
+    if not ok or type(cur) ~= "number" or cur < RED_WINDOW then
+        local ok2, err = pcall(p.setProbeDistance, RED_WINDOW)
+        if not ok2 then
+            print("WARN: cannot set probe distance on a bogey: " .. tostring(err))
+        end
     end
 end
 
--- Call a bogey peripheral method; returns ok, result. Callers fail back to
--- the redstone sides when it fails or the bogey is missing.
-local function bCall(method, ...)
-    if bogey and bogey[method] then
-        local ok, r1 = pcall(bogey[method], ...)
+-- Distance (blocks) to the nearest red-for-us signal ahead, or nil if clear.
+-- Fixed axle per config: each axle looks out of its own end of the bogey.
+-- Only signals inside RED_WINDOW count, so a bogey left with a longer scan
+-- range does not report a red that is far away.
+local function redSignalAhead()
+    local best = nil
+    for _, p in ipairs(bogeys) do
+        local ok, d = pcall(p.getProbeOccupiedSignalDistance, RED_PROBE_FRONT)
+        if ok and type(d) == "number" and d >= 0 and d <= RED_WINDOW then
+            local ok2, aligned = pcall(p.getProbeOccupiedSignalAligned, RED_PROBE_FRONT)
+            if ok2 and aligned then
+                if best == nil or d < best then best = d end
+            end
+        end
+    end
+    return best
+end
+
+-- ============================================================
+-- 0d. Performance curve from calib.json (automatic control / LKJ input)
+-- ============================================================
+-- The calibration run fits two straight lines in speed v (m/s):
+--   accel: a(v) = a0 + a1 * v   at full traction (traction fades as v rises,
+--                                reaching 0 at the bogey's target speed)
+--   brake: d(v) = d0 + d1 * v   deceleration at FULL brake strength
+-- Both come from least-squares fits over per-interval dv/dt samples, so a
+-- speed-dependent rate is captured instead of a single average. The brake run
+-- is measured at calibBrakeStrength and normalised to full brake (brake force
+-- is linear in brakeStrength in the bogey physics).
+-- Integrate them for acceleration time and braking distance:
+--   t = integral dv / a(v)          s = integral v / d(v) dv
+-- This is what a future LKJ target-speed/braking-curve controller needs.
+local perf = { accel = nil, brake = nil, top = nil, savedAt = nil }
+
+local function loadPerf()
+    if not fs.exists(CALIB_FILE) then return false end
+    local ok, data = pcall(function()
+        local f = fs.open(CALIB_FILE, "r")
+        local text = f.readAll()
+        f.close()
+        return textutils.unserializeJSON(text)
+    end)
+    if not ok or type(data) ~= "table" then return false end
+    local acc, brk = data.accel, data.brake
+    if type(acc) == "table" and type(acc.a0) == "number" then
+        perf.accel = { a0 = acc.a0, a1 = acc.a1 or 0, vmax = acc.vmax, rms = acc.rms, r2 = acc.r2 }
+    elseif type(acc) == "table" and type(acc.mps2) == "number" then
+        perf.accel = { a0 = acc.mps2, a1 = 0 }
+    end
+    if type(brk) == "table" then
+        if type(brk.d0) == "number" then
+            perf.brake = { d0 = brk.d0, d1 = brk.d1 or 0, rms = brk.rms, r2 = brk.r2 }
+        elseif type(brk.mps2Full) == "number" then
+            perf.brake = { d0 = brk.mps2Full, d1 = 0 }
+        elseif type(brk.mps2) == "number" and type(brk.strength) == "number" and brk.strength > 0 then
+            perf.brake = { d0 = brk.mps2 / brk.strength, d1 = 0 }
+        elseif type(brk.mps2) == "number" then
+            perf.brake = { d0 = brk.mps2, d1 = 0 }
+        end
+    end
+    perf.top = type(data.topMps) == "number" and data.topMps or nil
+    perf.savedAt = data.savedAt
+    return perf.accel ~= nil or perf.brake ~= nil
+end
+
+-- Acceleration available at v (m/s) at full traction, or nil if unknown.
+local function accelAt(v)
+    if not perf.accel then return nil end
+    return math.max(0, perf.accel.a0 + perf.accel.a1 * v)
+end
+
+-- Deceleration at v (m/s) for a brake strength (default 1 = full brake).
+local function decelAt(v, strength)
+    if not perf.brake then return nil end
+    return math.max(0, (perf.brake.d0 + perf.brake.d1 * v) * (strength or 1))
+end
+
+-- Track distance (blocks) to slow from v0 to v1, integrating ds = v/d(v) dv
+-- with the trapezoid rule. nil = no curve, or the deceleration vanishes in the
+-- interval (the train could not stop).
+local function brakeDistance(v0, v1, strength)
+    if not perf.brake then return nil end
+    if v0 <= v1 then return 0 end
+    local steps = 64
+    local dv = (v0 - v1) / steps
+    local s = 0
+    for i = 0, steps - 1 do
+        local va = v1 + i * dv
+        local vb = va + dv
+        local da, db = decelAt(va, strength), decelAt(vb, strength)
+        if da <= 0.01 or db <= 0.01 then return nil end
+        s = s + dv * (va / da + vb / db) / 2
+    end
+    return s
+end
+
+-- Time (s) to accelerate from v0 to v1 at full traction, integrating
+-- dt = dv / a(v). nil = no curve, or the acceleration vanishes in the interval.
+local function accelTime(v0, v1)
+    if not perf.accel then return nil end
+    if v1 <= v0 then return 0 end
+    local steps = 64
+    local dv = (v1 - v0) / steps
+    local t = 0
+    for i = 0, steps - 1 do
+        local va = v0 + i * dv
+        local vb = va + dv
+        local aa, ab = accelAt(va), accelAt(vb)
+        if aa <= 0.01 or ab <= 0.01 then return nil end
+        t = t + dv * (1 / aa + 1 / ab) / 2
+    end
+    return t
+end
+
+local function printPerf()
+    if not perf.accel and not perf.brake then
+        print("Performance curve: none - run Calibrate")
+        return
+    end
+    local parts = {}
+    if perf.accel then
+        local s = string.format("accel %.3f%+.4f*v m/s^2", perf.accel.a0, perf.accel.a1)
+        local v0 = perf.accel.vmax
+        if not (type(v0) == "number" and v0 > 0) and perf.accel.a1 < 0 and perf.accel.a0 > 0 then
+            v0 = -perf.accel.a0 / perf.accel.a1
+        end
+        if type(v0) == "number" and v0 > 0 then
+            s = s .. string.format(" (zero at %.0f km/h)", v0 * 3.6)
+        end
+        if type(perf.accel.r2) == "number" then
+            s = s .. string.format(", r2 %.3f", perf.accel.r2)
+        end
+        parts[#parts + 1] = s
+    end
+    if perf.brake then
+        local s = string.format("brake(full) %.3f%+.4f*v m/s^2", perf.brake.d0, perf.brake.d1)
+        if type(perf.brake.r2) == "number" then
+            s = s .. string.format(", r2 %.3f", perf.brake.r2)
+        end
+        parts[#parts + 1] = s
+    end
+    if perf.top then parts[#parts + 1] = string.format("top %.0f km/h", perf.top * 3.6) end
+    print("Performance curve: " .. table.concat(parts, " | "))
+    if perf.accel and perf.top then
+        local t = accelTime(0, perf.top)
+        if t then print(string.format("  full traction 0->top: %.0f s", t)) end
+        if type(perf.accel.vmax) == "number" and perf.accel.vmax > 0
+            and perf.top > 0 and math.abs(perf.accel.vmax - perf.top) / perf.top > 0.15 then
+            print(string.format("  NOTE: curve reaches zero at %.0f km/h but the run topped out at %.0f km/h",
+                perf.accel.vmax * 3.6, perf.top * 3.6))
+        end
+    end
+    if perf.brake and perf.top then
+        local d = brakeDistance(perf.top, 0, 1)
+        if d then print(string.format("  full brake top->0: %.0f blocks", d)) end
+    end
+end
+
+loadPerf()
+printPerf()
+
+-- Call one bogey peripheral method; returns ok. There is no fallback channel
+-- any more, so a failing call simply means the value was not applied (the
+-- failure is reported once on the console).
+local function bCallOne(p, method, ...)
+    if p and p[method] then
+        local ok, r1 = pcall(p[method], ...)
         if not ok and not bCallWarned then
             bCallWarned = true
             print("BOGEY CALL FAILED: " .. tostring(r1) .. " (reported once)")
         end
-        return ok, r1
+        return ok
     end
     return false
 end
@@ -97,7 +288,7 @@ local MU_CTRL_TTL = 1.5   -- s: slave applies EB if no fresh master control
 local locoName = os.getComputerLabel() or ("CC#" .. os.getComputerID())
 local selfID   = os.getComputerID()
 local visualDriving = false   -- runtime "VisualDriving" command state
-local redLatch      = false   -- red input at 15 latches full brake until handle EB
+local redLatch      = false   -- stop curve cannot stop in time: full brake until handle EB
 local calib         = nil     -- active performance-calibration state machine (nil = idle)
 local calibHold     = false   -- hold full brake after calibration until really stopped
 local calibArmed    = false   -- "Calibrate" typed at EB handle arms it; pull to N to start
@@ -118,61 +309,41 @@ local function leverMode(sig)
 end
 
 -- Set brake output; level is strength 0..1 (bogey brakeStrength).
--- Legacy redstone mode maps back to the 0-15 analog scale.
--- Bogey mode only calls the (mainThread) peripheral when the value actually
+-- The (mainThread) peripheral is only called when the value actually
 -- changed, so the loop never blocks on per-tick peripheral tasks.
-local revSign = 1   -- bogey mode: sign applied to the drive stress (reverse)
+local revSign = 1   -- sign applied to the drive stress (reverse)
 local function setBrake(level)
     local out = math.max(0, math.min(1, level))
-    if USE_BOGEY then
-        if math.abs(out - lastSentBrake) >= 0.01 then
-            lastSentBrake = out
-            if bCall("setBrakeStrengthOverride", out) then
-                return
-            end
-        else
-            return
+    for _, p in ipairs(bogeys) do
+        local last = lastSentBrake[p]
+        if last == nil or math.abs(out - last) >= 0.01 then
+            lastSentBrake[p] = out
+            bCallOne(p, "setBrakeStrengthOverride", out)
         end
-    end
-    if SIDE_BRAKE then
-        redstone.setAnalogOutput(SIDE_BRAKE, math.ceil(out * 15))
     end
 end
 
--- Set reverse gearbox (digital HIGH = activate). Bogey mode: the reverse sign
--- is remembered here and applied to the drive stress (negative = reverse).
+-- Remember the travel direction; it is applied as the sign of the drive
+-- stress (negative = reverse). There is no reverse gearbox output any more.
 local function setReverseGearbox(activate)
     revSign = activate and -1 or 1
-    if not USE_BOGEY and SIDE_REVGEARBOX then
-        redstone.setOutput(SIDE_REVGEARBOX, activate)
-    end
 end
 
--- Set throttle output; throttleInput is drive stress 0..DRIVE_STRESS_MAX (bogey
--- setMaxStress). revSign picks the direction. Bogey mode needs kinetic RPM
--- (getSpeed) to produce force, so the gearbox redstone is held at full throttle
--- (0 after inversion) to keep the RPM source alive. Legacy redstone mode maps
--- back to the 0-15 analog scale.
+-- Set throttle output; throttleInput is drive stress 0..DRIVE_STRESS_MAX
+-- (bogey setMaxStress). revSign picks the direction, and the change-only
+-- cache stores the SIGNED value so a direction flip with an unchanged
+-- magnitude is still pushed to the bogey.
+-- The bogey needs kinetic RPM (getSpeed) to produce force - that comes from
+-- the gearbox / kinetic network, which must be fed by constant redstone.
 local function setThrottleOutput(throttleInput)
-    if USE_BOGEY then
-        local out = math.max(0, math.min(DRIVE_STRESS_MAX, throttleInput))
-        if math.abs(out - lastSentStress) >= 1 then
-            lastSentStress = out
-            if bCall("setMaxStress", revSign * out) then
-                if SIDE_THROTTLE then
-                    redstone.setAnalogOutput(SIDE_THROTTLE, 0)   -- full gearbox input (inverted)
-                end
-                return
-            end
-        else
-            if SIDE_THROTTLE then
-                redstone.setAnalogOutput(SIDE_THROTTLE, 0)   -- keep gearbox RPM source fed
-            end
-            return
+    local out = math.max(0, math.min(DRIVE_STRESS_MAX, throttleInput))
+    local signed = revSign * out
+    for _, p in ipairs(bogeys) do
+        local last = lastSentStress[p]
+        if last == nil or math.abs(signed - last) >= 1 then
+            lastSentStress[p] = signed
+            bCallOne(p, "setMaxStress", signed)
         end
-    end
-    if SIDE_THROTTLE then
-        redstone.setAnalogOutput(SIDE_THROTTLE, 15 - math.ceil(throttleInput / DRIVE_STRESS_MAX * 15))
     end
 end
 
@@ -180,14 +351,17 @@ end
 -- 2. RHI notch mapping (master side)
 -- ============================================================
 -- Notch mapping (RHI handle):
---   0    : EB  - emergency brake, brake output 15, set speed = 0
---   1-9  : B9..B1 - direct brake output 10-sig (sig 1 -> brake 9, sig 9 -> brake 1), set speed = 0
+--   0    : EB  - emergency brake, full brake strength 1.0, set speed = 0
+--   1-9  : B9..B1 - direct brake strength (10-sig)/15 (sig 1 -> 0.6 ... sig 9 -> 0.067), set speed = 0
 --   10   : N   - neutral, no traction, no brake (coast)
 --   11   : K1  - decrease set speed 5 km/h per second
 --   12   : K2  - decrease set speed 1 km/h per second
 --   13   : C   - keep set speed unchanged
 --   14   : K3  - increase set speed 1 km/h per second
 --   15   : K4  - increase set speed 5 km/h per second
+--
+-- Coming back into the N/K1..K4 region from EB, a B notch or C re-seeds the
+-- set speed with the current actual speed (see updateRHI).
 --
 -- Ramp rates in m/s per second; per-tick step is scaled by measured dt so
 -- the rates stay exactly 5/1 km/h/s regardless of pidDt or loop overhead.
@@ -199,10 +373,33 @@ local rhi_setSpeed = 0        -- persistent set speed maintained by RHI
 local notchLevel   = "?"      -- current notch name (EB/B9..B1/N/K1/K2/C/K3/K4), for display
 local notchBrake   = 0        -- direct brake signal for B9..B1 (0 = none)
 local notchNeutral = false    -- true = N (signal 10), no traction and no brake
+local lastNotchCat = nil      -- notch region of the previous tick (see below)
 
--- Call each loop; updates rhi_setSpeed, notchLevel and mode flags from current notch signal
-local function updateRHI(dt)
+-- Notch regions: EB and B hold the set speed at zero, C freezes it, and
+-- N/K1..K4 are the region where the set speed is actually driven.
+local function notchCategory(sig)
+    if sig == 0 then return "eb" end
+    if sig <= 9 then return "brake" end
+    if sig == 13 then return "hold" end
+    return "kn"        -- N (10) and K1..K4 (11, 12, 14, 15)
+end
+
+-- Call each loop; updates rhi_setSpeed, notchLevel and mode flags from current
+-- notch signal. actualSpeed (m/s) is used to hand the set speed over when the
+-- handle comes back into the N/K region.
+local function updateRHI(dt, actualSpeed)
     local sig = redstone.getAnalogInput(SIDE_SETSPEED)
+
+    -- Entering the speed-control region (N / K1..K4) from EB, a B notch or C
+    -- starts the set speed at the CURRENT speed: the train then holds or ramps
+    -- from where it is, instead of from the stale value EB/B left behind
+    -- (zero after EB/B, an old target after C). Inside the N/K region the set
+    -- speed is left alone so the K ramps keep working.
+    local cat = notchCategory(sig)
+    if cat == "kn" and lastNotchCat ~= "kn" then
+        rhi_setSpeed = math.max(0, math.min(MAX_SPEED, actualSpeed or 0))
+    end
+    lastNotchCat = cat
 
     if sig == 0 then
         -- EB: full emergency brake, set speed zero
@@ -357,8 +554,8 @@ end
 -- 4. Output slew-rate limiting (master side)
 -- ============================================================
 -- In master mode, throttle and brake outputs ramp toward the PID target at
--- most MAX_OUT_DELTA units (0-15) per loop tick, so force never jumps.
--- EB / B / N / fault states still switch instantly.
+-- most MAX_OUT_DELTA stress units (0..128) per 0.1 s of loop time, so force
+-- never jumps. EB / B / N / fault states still switch instantly.
 local MAX_OUT_DELTA = cfg.maxOutputDelta or 17.0
 local lastDriveOut  = 0
 local lastBrakeOut  = 0
@@ -411,11 +608,18 @@ local function mCall(method, ...)
     end
 end
 
+local monH = 0   -- monitor height in characters (0 = unknown)
 if monitor then
     -- Shrink text so more info fits on a 1x1 monitor
     mCall("setTextScale", 0.5)
     mCall("setBackgroundColor", colors.black)
     mCall("clear")
+    local ok, w, h = pcall(monitor.getSize)
+    if ok and type(h) == "number" then
+        monH = h
+        -- A 1x1 monitor at text scale 0.5 is 15x10 characters; a 2x2 is 30x20.
+        print(string.format("Monitor: %dx%d characters", w or 0, h))
+    end
 end
 
 -- Speed color: green=slow, yellow=mid, red=fast, gray=stopped
@@ -431,8 +635,8 @@ local function speedColor(v)
     end
 end
 
--- updateDisplay(setSpeed, actualSpeed, driveOut, brakeOut, reverse, level, role, fault, redActive)
-local function updateDisplay(setSpeed, actualSpeed, driveOut, brakeOut, reverse, level, role, fault, redActive)
+-- updateDisplay(setSpeed, actualSpeed, driveOut, brakeOut, reverse, level, role, fault, redDist)
+local function updateDisplay(setSpeed, actualSpeed, driveOut, brakeOut, reverse, level, role, fault, redDist)
     if not monitor then return end
     mCall("clear")
 
@@ -477,10 +681,22 @@ local function updateDisplay(setSpeed, actualSpeed, driveOut, brakeOut, reverse,
         monitor.write("DIR:  FWD >>")
     end
 
-    -- Line 7: Time + BRK / RED indicators
+    -- Line 7: status flags (BRK / red distance / VIS / LAT / ARM)
+    local flags = {}
+    if brakeOut > 0 then flags[#flags + 1] = "BRK" end
+    if redDist then flags[#flags + 1] = string.format("R:%.0f", redDist) end
+    if visualDriving then flags[#flags + 1] = "VIS" end
+    if redLatch then flags[#flags + 1] = "LAT" end
+    if calibArmed then flags[#flags + 1] = "ARM" end
+    local clock = os.date("%H:%M:%S")
+    local line7 = table.concat(flags, " ")
+    if monH < 9 then
+        -- Short monitor: no room for the clock line, keep it on line 7.
+        line7 = (line7 ~= "") and (clock .. " " .. line7) or clock
+    end
     mCall("setCursorPos", 1, 7)
     mCall("setTextColor", colors.lightGray)
-    monitor.write(os.date("%H:%M:%S") .. (brakeOut > 0 and " BRK" or "") .. (redActive and " RED" or "") .. (visualDriving and " VIS" or "") .. (redLatch and " LAT" or "") .. (calibArmed and " ARM" or ""))
+    monitor.write(line7)
 
     -- Line 8: Role + notch level, or network fault
     mCall("setCursorPos", 1, 8)
@@ -490,6 +706,13 @@ local function updateDisplay(setSpeed, actualSpeed, driveOut, brakeOut, reverse,
     else
         mCall("setTextColor", colors.white)
         monitor.write((role == "master" and "M:" or "S:") .. (level or "?"))
+    end
+
+    -- Line 9: clock, under the notch level
+    if monH >= 9 then
+        mCall("setCursorPos", 1, 9)
+        mCall("setTextColor", colors.lightGray)
+        monitor.write(clock)
     end
 end
 
@@ -537,7 +760,6 @@ end
 -- Commands are typed at the terminal and submitted with Enter.
 --   VisualDriving (or vd) : toggle visual driving mode (speed cap +
 --                           red signals allowed). Type help for the list.
-local CHAN_BROADCAST = 65535
 local cmdBuffer = ""
 
 local function submitCommand()
@@ -577,16 +799,18 @@ local function handleKey(key)
     end
 end
 
--- Pull events unfiltered so nothing is discarded: rednet messages arrive
--- either as rednet_message (from the rednet background) or modem_message
--- (direct) - handle BOTH; keyboard char/key events drive commands; the
--- timer bounds the wait and paces the loop. This replaces rednet.receive
--- and sleep(), neither of which can coexist with live keyboard input.
+-- Pull events unfiltered so nothing is discarded: rednet traffic arrives as
+-- rednet_message (the rednet background daemon, started in a parallel
+-- coroutine by the BIOS, converts modem_message and CC's parallel library
+-- delivers the event to every listener); keyboard char/key events drive
+-- commands; the timer bounds the wait and paces the loop. This replaces
+-- rednet.receive and sleep(), neither of which can coexist with live
+-- keyboard input.
 -- Returns sender, msg, protocol, or nil on timeout.
 local function receiveWithInput(timeout)
     local timer = os.startTimer(timeout)
     while true do
-        local ev, p1, p2, p3, p4 = os.pullEvent()
+        local ev, p1, p2, p3 = os.pullEvent()
         if ev == "terminate" then
             error("Terminated", 0)
         elseif ev == "timer" then
@@ -596,17 +820,8 @@ local function receiveWithInput(timeout)
         elseif ev == "key" then
             handleKey(p1)
         elseif ev == "rednet_message" then
-            -- background-converted message: senderID, message, protocol
+            -- senderID, message, protocol
             return p1, p2, p3
-        elseif ev == "modem_message" then
-            -- direct modem message (same wire format as rednet)
-            local channel, replyChannel, message = p2, p3, p4
-            if channel == CHAN_BROADCAST or channel == selfID then
-                local ok, data = pcall(textutils.unserialize, message)
-                if ok and type(data) == "table" then
-                    return replyChannel, data.nMessage, data.nProtocol
-                end
-            end
         end
     end
 end
@@ -625,7 +840,8 @@ end
 -- meet the pre-checks keeps the calibration armed (printed once) so you can
 -- retry; type "Calibrate" again at EB to disarm.
 
-local calibAccelRate, calibBrakeRate = nil, nil
+local calibAccelRate, calibBrakeRate, calibTopSpeed = nil, nil, nil
+local calibAccelFit, calibBrakeFit = nil, nil   -- { a0, a1, v0, rms, r2, n }
 
 local function calibFit(samples)
     local n = #samples
@@ -639,77 +855,252 @@ local function calibFit(samples)
     end
     local den = n * sTT - sT * sT
     if math.abs(den) < 1e-9 then return nil end
-    return (n * sTV - sT * sV) / den   -- least-squares slope = m/s^2
+    -- least-squares slope = dv/dt in m/s^2: POSITIVE while accelerating,
+    -- NEGATIVE while braking. Callers must handle the sign.
+    return (n * sTV - sT * sV) / den
+end
+
+-- Least-squares fit of a(v) = a0 + a1*v over (t,v) samples.
+--
+-- The model is the physics of this bogey: driveMag is proportional to
+-- (targetSpeed - v), so acceleration falls off linearly with speed and hits
+-- zero at the bogey's target speed. a1 is therefore expected to be NEGATIVE.
+--
+-- Raw per-tick slopes are NOT used directly: at 20 Hz the speed change per
+-- tick is tiny near the top speed (where the fall-off is) and sensor
+-- quantisation would dominate. Instead the samples are binned by speed and
+-- each bin contributes ONE point - the average rate over that bin's time span,
+-- placed at the mean speed. Long spans (which is exactly what the near-top
+-- bins have) give a much better rate estimate than a single 0.05 s interval.
+--
+-- sign = +1 for the accel run, -1 for the brake run (deceleration positive).
+-- Returns a table { a0, a1, v0, rms, r2, n } or nil:
+--   v0  = speed where a(v) = 0 (the predicted traction ceiling)
+--   rms = residual RMS of the fit (m/s^2), r2 = coefficient of determination
+local function fitLinear(samples, sign, binWidth)
+    binWidth = binWidth or 1.0
+    local bins = {}
+    for _, s in ipairs(samples) do
+        local key = math.floor(s.v / binWidth)
+        local b = bins[key]
+        if b then
+            b.t1, b.v1, b.n = s.t, s.v, b.n + 1
+        else
+            bins[key] = { t0 = s.t, t1 = s.t, v0 = s.v, v1 = s.v, n = 1 }
+        end
+    end
+    local pts = {}
+    for _, b in pairs(bins) do
+        local dt = b.t1 - b.t0
+        local v = (b.v0 + b.v1) / 2
+        if b.n >= 2 and dt >= 0.25 and v >= 0.5 then
+            pts[#pts + 1] = { v = v, a = sign * (b.v1 - b.v0) / dt }
+        end
+    end
+    local m = #pts
+    if m < 4 then return nil end
+
+    local sV, sA, sVV, sVA = 0, 0, 0, 0
+    for _, p in ipairs(pts) do
+        sV, sA = sV + p.v, sA + p.a
+        sVV, sVA = sVV + p.v * p.v, sVA + p.v * p.a
+    end
+    local den = m * sVV - sV * sV
+    local a0, a1
+    if math.abs(den) < 1e-9 then
+        a0, a1 = sA / m, 0          -- speeds nearly constant: flat line
+    else
+        a1 = (m * sVA - sV * sA) / den
+        a0 = (sA - a1 * sV) / m
+    end
+
+    -- Fit quality and the zero-acceleration speed.
+    local ssRes, ssTot, aMean = 0, 0, sA / m
+    for _, p in ipairs(pts) do
+        local e = p.a - (a0 + a1 * p.v)
+        ssRes = ssRes + e * e
+        ssTot = ssTot + (p.a - aMean) * (p.a - aMean)
+    end
+    local v0 = (a1 < -1e-6 and a0 > 0) and (-a0 / a1) or nil
+    return {
+        a0 = a0, a1 = a1, v0 = v0, n = m,
+        rms = math.sqrt(ssRes / m),
+        r2 = ssTot > 1e-9 and (1 - ssRes / ssTot) or nil,
+    }
 end
 
 local function saveCalib()
+    if not calibAccelRate or not calibBrakeRate then return false end
+    local strength = CALIB_BRAKE_STR
+    -- Brake force is linear in brakeStrength in the bogey physics, so the
+    -- full-brake rate is the measured rate divided by the strength used.
+    local full = calibBrakeRate / strength
+    local function r3(x) return math.floor((x or 0) * 1000 + 0.5) / 1000 end
+
+    -- Fitted curves (fall back to a flat line at the average rate).
+    local acc = calibAccelFit or { a0 = calibAccelRate, a1 = 0 }
+    local brk = { a0 = full, a1 = 0 }
+    if calibBrakeFit then
+        brk = {
+            a0 = calibBrakeFit.a0 / strength,
+            a1 = calibBrakeFit.a1 / strength,
+            rms = (calibBrakeFit.rms or 0) / strength,
+            r2 = calibBrakeFit.r2, n = calibBrakeFit.n,
+        }
+    end
+
+    -- Sampled profile for external consumers (LKJ/tcc): step 2 m/s up to top.
+    local step = 2.0
+    local vTop = calibTopSpeed or 0
+    local vTab, aTab, dTab = {}, {}, {}
+    for v = 0, math.ceil(vTop / step) * step, step do
+        vTab[#vTab + 1] = r3(v)
+        aTab[#aTab + 1] = r3(math.max(0, acc.a0 + acc.a1 * v))
+        dTab[#dTab + 1] = r3(math.max(0, brk.a0 + brk.a1 * v))
+    end
+
     local data = {
-        version = 1,
+        version = 3,
         savedAt = os.date("%Y-%m-%dT%H:%M:%S"),
-        accel = { mps2 = math.floor(calibAccelRate * 1000 + 0.5) / 1000 },
-        brake = { mps2 = math.floor(calibBrakeRate * 1000 + 0.5) / 1000 },
-        brakeTargetMps = CALIB_BRAKE_TARGET,
+        topMps = r3(vTop),
+        accel = {
+            mps2 = r3(calibAccelRate),   -- average over the measurement window
+            a0 = r3(acc.a0), a1 = r3(acc.a1),
+            vmax = r3((acc.a0 > 0 and acc.a1 < 0) and (-acc.a0 / acc.a1) or 0),
+            rms = r3(acc.rms), r2 = r3(acc.r2), bins = acc.n or 0,
+        },
+        brake = {
+            mps2 = r3(calibBrakeRate),   -- measured at the strength below
+            strength = strength,
+            mps2Full = r3(full),
+            d0 = r3(brk.a0), d1 = r3(brk.a1),   -- full-brake curve
+            rms = r3(brk.rms), r2 = r3(brk.r2), bins = brk.n or 0,
+        },
+        profile = { step = step, v = vTab, accel = aTab, brake = dTab },
     }
     local f = fs.open(CALIB_FILE, "w")
     if not f then return false end
     f.write(textutils.serializeJSON(data, true))
     f.close()
+    -- Apply the fresh curve immediately (no reboot needed).
+    loadPerf()
+    printPerf()
     return true
 end
 
 -- Advance the calibration state machine. Returns drive, brake, next (nil = end).
+-- Profile: full throttle until the speed plateaus (full traction can no longer
+-- raise it) or MAX_SPEED (the set-speed ceiling) is reached, whichever comes
+-- first; then coast briefly and brake at CALIB_BRAKE_STR to a standstill.
 local function calibStep(c, dt, v, now)
     if c.step == "accel_warmup" then
         -- Full throttle on; wait CALIB_SETTLE so the output has taken effect
         if now - c.t0 >= CALIB_SETTLE then
             c.step, c.t0, c.samples = "accel_meas", now, {}
+            c.samplesT0 = now          -- time base shared with the climb
+            c.maxSeen, c.lastGainAt = v, now
         end
         return DRIVE_STRESS_MAX, 0, c
     elseif c.step == "accel_meas" then
-        c.samples[#c.samples + 1] = { t = now - c.t0, v = v }
+        c.samples[#c.samples + 1] = { t = now - c.samplesT0, v = v }
+        if v > c.maxSeen then c.maxSeen = v end
         if now - c.t0 >= CALIB_ACCEL_DUR then
             local a = calibFit(c.samples)
-            if a then
+            if a and a > 0.05 then
                 calibAccelRate = a
                 print(string.format("CALIB accel: %.3f m/s^2 (%.1f km/h/s, %d samples)", a, a * 3.6, #c.samples))
                 c.step, c.t0 = "run_up", now
+                c.lastGainAt = now
             else
-                print("CALIB FAILED: accel fit invalid (need >= 5 samples)")
+                print("CALIB FAILED: accel fit invalid" ..
+                    (a and " (speed did not rise)" or " (need >= 5 samples)"))
                 return 0, 1.0, nil
             end
         end
         return DRIVE_STRESS_MAX, 0, c
     elseif c.step == "run_up" then
-        -- Full throttle until the brake-test cruise speed
-        if v >= CALIB_BRAKE_TARGET then
+        -- Keep sampling through the whole climb: this series is what the
+        -- a(v) = a0 + a1*v curve is fitted from (traction fades with speed).
+        c.samples[#c.samples + 1] = { t = now - c.samplesT0, v = v }
+        -- Climb at full throttle until the top speed is found: the speed stops
+        -- gaining more than CALIB_PLATEAU_EPS for CALIB_PLATEAU_TIME (it
+        -- hovers around a value) or the configured ceiling MAX_SPEED is hit.
+        if v > c.maxSeen + CALIB_PLATEAU_EPS then
+            c.maxSeen = v
+            c.lastGainAt = now
+        end
+        local plateau = now - c.lastGainAt >= CALIB_PLATEAU_TIME
+        local capped = c.maxSeen >= MAX_SPEED
+        if plateau or capped then
+            local vTop = math.min(c.maxSeen, MAX_SPEED)
+            if vTop < CALIB_MIN_TOP then
+                print(string.format("CALIB FAILED: top speed only %.1f km/h - check traction/gearbox",
+                    vTop * 3.6))
+                return 0, 1.0, nil
+            end
+            print(string.format("CALIB top speed: %.1f km/h (%s)", vTop * 3.6,
+                capped and "set-speed ceiling" or "traction limit"))
+            c.vTop = vTop
+            calibTopSpeed = vTop
+            local fit = fitLinear(c.samples, 1)
+            if fit then
+                calibAccelFit = fit
+                print(string.format("CALIB accel curve: a(v) = %.3f%+.4f*v m/s^2 | zero at %s | %d bins, rms %.3f%s",
+                    fit.a0, fit.a1, fit.v0 and string.format("%.1f m/s", fit.v0) or "n/a",
+                    fit.n, fit.rms, fit.r2 and string.format(", r2 %.3f", fit.r2) or ""))
+                if fit.a1 > 0 then
+                    print("WARN: accel rises with speed - curve looks wrong (check traction/sensor)")
+                end
+            else
+                print("CALIB: accel curve needs more bins - using the average rate")
+            end
+            c.brakeTimeout = math.max(CALIB_BRAKE_TIMEOUT, vTop / CALIB_BRAKE_MIN_DECEL)
             c.step, c.t0, c.samples = "brake_settle", now, {}
         elseif now - c.t0 > CALIB_RUN_TIMEOUT then
-            print("CALIB FAILED: could not reach " .. string.format("%.0f", CALIB_BRAKE_TARGET * 3.6) .. " km/h")
+            print("CALIB FAILED: no stable top speed within " .. CALIB_RUN_TIMEOUT .. "s")
             return 0, 1.0, nil
         end
         return DRIVE_STRESS_MAX, 0, c
     elseif c.step == "brake_settle" then
-        -- Coast a moment, then slam the brake with a stable output
+        -- Coast a moment, then apply the calibration brake with a stable output
         if now - c.t0 >= CALIB_SETTLE then
             c.step, c.t0, c.samples = "brake_meas", now, {}
+            print(string.format("CALIB: braking at %.0f%% from %.1f km/h", CALIB_BRAKE_STR * 100, v * 3.6))
         end
         return 0, 0, c
     elseif c.step == "brake_meas" then
         c.samples[#c.samples + 1] = { t = now - c.t0, v = v }
         local stopped = v <= CALIB_STOP
-        if stopped or now - c.t0 >= CALIB_BRAKE_TIMEOUT then
+        if stopped or now - c.t0 >= (c.brakeTimeout or CALIB_BRAKE_TIMEOUT) then
             local b = calibFit(c.samples)
-            if b and b > 0 then
-                calibBrakeRate = b
-                print(string.format("CALIB brake: %.3f m/s^2 (%.1f km/h/s, %d samples)", b, b * 3.6, #c.samples))
+            -- calibFit returns dv/dt, which is NEGATIVE while braking, so the
+            -- deceleration is -b. (An older version tested b > 0, which no
+            -- real brake run can ever satisfy - calibration then always
+            -- reported "brake fit invalid" and never saved anything.)
+            if b and b < -0.05 then
+                calibBrakeRate = -b
+                print(string.format("CALIB brake: %.3f m/s^2 at %.0f%% (%.1f km/h/s, %d samples)",
+                    calibBrakeRate, CALIB_BRAKE_STR * 100, calibBrakeRate * 3.6, #c.samples))
+                -- Speed-dependent brake curve, normalised to full brake.
+                local fit = fitLinear(c.samples, -1)
+                if fit then
+                    calibBrakeFit = fit
+                    print(string.format("CALIB brake curve: d(v) = %.3f%+.4f*v m/s^2 at full brake | %d bins, rms %.3f%s",
+                        fit.a0 / CALIB_BRAKE_STR, fit.a1 / CALIB_BRAKE_STR, fit.n, fit.rms / CALIB_BRAKE_STR,
+                        fit.r2 and string.format(", r2 %.3f", fit.r2) or ""))
+                else
+                    print("CALIB: brake curve needs more bins - using the average rate")
+                end
                 local ok = saveCalib()
                 print(ok and ("CALIB: saved to " .. CALIB_FILE) or ("CALIB: FAILED to write " .. CALIB_FILE))
+            elseif b and b > 0.05 then
+                print("CALIB FAILED: speed rose during the brake run (brake not effective?)")
             else
                 print("CALIB FAILED: brake fit invalid" .. (stopped and "" or " (timeout)"))
             end
             return 0, 1.0, nil
         end
-        return 0, 1.0, c
+        return 0, CALIB_BRAKE_STR, c
     end
     return 0, 1.0, nil   -- unknown step: bail out with full brake
 end
@@ -725,7 +1116,7 @@ local function refuse(msg)
     end
 end
 
-local function startCalibration(role, fault, redLevel, actualSpeed)
+local function startCalibration(role, fault, redDist, actualSpeed)
     if not sensor then
         refuse("no velocity sensor - cannot calibrate")
         return
@@ -742,17 +1133,21 @@ local function startCalibration(role, fault, redLevel, actualSpeed)
         refuse("train must be stopped (now " .. string.format("%.1f", actualSpeed * 3.6) .. " km/h)")
         return
     end
-    if redLevel > 0 and not visualDriving then
-        refuse("red signal ahead - cannot calibrate")
+    -- The run-up needs a clear stretch: refuse if a red signal is already
+    -- closer than CALIB_START_CLEAR. The exact top speed is unknown up front,
+    -- so the mid-run check aborts as soon as the red is about to trip.
+    if redDist and not visualDriving and redDist < CALIB_START_CLEAR then
+        refuse(string.format("red signal %.0f blocks ahead - cannot calibrate", redDist))
         return
     end
     calib = { step = "accel_warmup", phase = "accel", t0 = os.clock(), dur = CALIB_SETTLE }
     calibHold = false
     calibArmed = false
     lastRefuse = ""
-    calibAccelRate, calibBrakeRate = nil, nil
-    print("CALIB: running - full throttle " .. CALIB_ACCEL_DUR .. "s, then brake test from " ..
-        string.format("%.0f", CALIB_BRAKE_TARGET * 3.6) .. " km/h")
+    calibAccelRate, calibBrakeRate, calibTopSpeed = nil, nil, nil
+    calibAccelFit, calibBrakeFit = nil, nil
+    print(string.format("CALIB: running - full throttle to top speed (max %.0f km/h), then brake at %.0f%%",
+        MAX_SPEED * 3.6, CALIB_BRAKE_STR * 100))
 end
 
 -- ============================================================
@@ -761,6 +1156,8 @@ end
 print("Locomotive program started: " .. locoName)
 print("Max speed: " .. MAX_SPEED .. " m/s | Ctrl+T to stop")
 print("Commands: VisualDriving (vd) | Calibrate (calib) | help")
+print(string.format("Red protection: probe %s axle, window %.0f blocks, EB inside %.0f blocks",
+    RED_PROBE_FRONT and "front" or "back", RED_WINDOW, RED_EB_DIST))
 
 -- Ensure all outputs are off at startup
 setBrake(0)
@@ -790,20 +1187,17 @@ while true do
     local leverSig = redstone.getAnalogInput(SIDE_REVERSE) or 0
     local role, masterReverse = leverMode(leverSig)
 
-    -- Red signal ahead (analog, 0=clear, 1-15=red, higher=closer) from the
-    -- sideRedSignal redstone input. Only the master evaluates it, and only
-    -- when going forward: in reverse the front signal is behind the travel
-    -- direction, so it must not protect (driver backs by sight). Slaves
-    -- follow the broadcast ctrl and must not react to the same red input the
-    -- master is already handling.
-    local redLevel = 0
+    -- Red signal ahead, from the bogey probe (blocks to the nearest red-for-us
+    -- signal). Only the master evaluates it, and only when running forward:
+    -- the probe axle is FIXED to one end of the bogey, so when reversing it
+    -- looks the wrong way and reverse stays exempt (the driver backs by
+    -- sight). Slaves follow the broadcast ctrl and must not read it.
+    local redDist = nil
     if role == "master" and not masterReverse then
-        redLevel = redstone.getAnalogInput(SIDE_RED) or 0
+        redDist = redSignalAhead()
     end
-    -- Protection only applies when going forward: in reverse the front
-    -- signal is behind the travel direction, so it must not brake.
-    -- Visual driving also exempts the red-signal brake.
-    local redActive = redLevel > 0 and not masterReverse and not visualDriving
+    -- Visual driving exempts the whole red-signal protection.
+    local redActive = redDist ~= nil and not visualDriving
     if leverSig ~= prevLeverSig then
         print("Lever: " .. leverSig .. " -> " .. role .. (masterReverse and " REV" or ""))
         prevLeverSig = leverSig
@@ -813,19 +1207,15 @@ while true do
     -- event dispatch (receiveWithInput) so nothing is discarded; protocol
     -- isolation is done in code below (and foreign traffic logged once).
     -- The blocking wait also paces the loop (no sleep(), which would eat
-    -- modem events and break reception).
-    local sender, msg, proto
-    if netUp then
-        sender, msg, proto = receiveWithInput(PID_DT)
-        if sender and proto ~= MU_PROTOCOL then
-            if not foreignWarned then
-                foreignWarned = true
-                print("Foreign protocol '" .. tostring(proto) .. "' ignored (ours '" .. MU_PROTOCOL .. "')")
-            end
-            msg = nil
+    -- modem events and break reception) and it is used even without a modem
+    -- so terminal commands (VisualDriving / Calibrate) still work.
+    local sender, msg, proto = receiveWithInput(PID_DT)
+    if sender and proto ~= MU_PROTOCOL then
+        if not foreignWarned then
+            foreignWarned = true
+            print("Foreign protocol '" .. tostring(proto) .. "' ignored (ours '" .. MU_PROTOCOL .. "')")
         end
-    else
-        sleep(PID_DT)   -- no modem: just pace the loop
+        msg = nil
     end
     if sender and type(msg) == "table" then
         if msg.role == "master" or msg.role == "slave" then
@@ -884,7 +1274,7 @@ while true do
     -- to start. Full pre-checks run here with current loop state; on refusal
     -- the calibration stays armed so the driver can retry from N.
     if calibArmed and redstone.getAnalogInput(SIDE_SETSPEED) == 10 then
-        startCalibration(role, fault, redLevel, actualSpeed)
+        startCalibration(role, fault, redDist, actualSpeed)
     end
 
     local driveOut, brakeOut, revOut = 0, 0, false
@@ -907,8 +1297,18 @@ while true do
     elseif calib then
         -- Performance calibration takes over: direct full-throttle / full-brake
         -- runs (no PID, no ramp) so the velocity samples measure raw physics.
-        if redActive or not sensor then
-            print("CALIB ABORTED: " .. (not sensor and "velocity sensor lost" or "red signal ahead"))
+        -- Abort if the lever leaves a master zone: a slave must never command
+        -- traction, and the network would otherwise see a phantom master.
+        -- Abort on a red signal only when it is actually too close for the
+        -- current speed (a distant red must not block a calibration run).
+        local redTooClose = redDist ~= nil and redDist <= RED_EB_DIST
+        if role ~= "master" then
+            print("CALIB ABORTED: lever left the master zone")
+            calib = nil
+            calibHold = true
+        elseif redTooClose or not sensor then
+            print("CALIB ABORTED: " .. (not sensor and "velocity sensor lost"
+                or string.format("red signal %.0f blocks ahead", redDist)))
             calib = nil
             calibHold = true
         end
@@ -926,7 +1326,7 @@ while true do
         revOut = masterReverse
         level = "CAL"
         setSpeed = 0
-        broadcastState("master", {
+        broadcastState(role, {
             throttle = driveOut, brake = brakeOut, reverse = revOut,
             level = level, setSpeed = 0,
         })
@@ -947,21 +1347,22 @@ while true do
         })
     elseif role == "master" then
         -- Master: RHI + PID + ramp
-        updateRHI(dt)
+        updateRHI(dt, actualSpeed)
         setSpeed = getSetSpeed()
         -- Visual driving caps the allowed set speed (red signals ignored)
         if visualDriving and setSpeed > VISUAL_MAX then
             setSpeed = VISUAL_MAX
         end
-        -- Red latch: red input at 15 (at the signal) holds full brake and
-        -- zeroes the set speed. The driver must pull the RHI handle to EB
-        -- (signal 0) to acknowledge and release the latch. Exempt in visual
-        -- driving mode.
+        -- Red-signal protection (probe, forward only). No approach braking:
+        -- the train drives normally until the red is inside RED_EB_DIST
+        -- blocks, i.e. the axle has effectively reached the signal -> EB
+        -- latch (full brake, set speed zero). The driver clears the latch by
+        -- pulling the RHI handle to EB (signal 0). Exempt in visual driving.
         local handleSig = redstone.getAnalogInput(SIDE_SETSPEED) or 0
         if redLatch and handleSig == 0 then
             redLatch = false
         end
-        if redLevel >= 15 and not masterReverse and not visualDriving then
+        if redActive and redDist <= RED_EB_DIST then
             redLatch = true
             rhi_setSpeed = 0
         end
@@ -972,10 +1373,6 @@ while true do
         elseif masterCut then
             driveOut, brakeOut = 0, 1.0
             lastDriveOut, lastBrakeOut = 0, 1.0
-        elseif redActive then
-            -- Red signal ahead (forward only): cut traction, brake strength = proximity
-            driveOut, brakeOut = 0, math.min(1, redLevel / 15)
-            lastDriveOut, lastBrakeOut = 0, brakeOut
         elseif notchBrake > 0 then
             -- B9..B1: direct brake signal 10-sig, set speed zero
             driveOut, brakeOut = 0, notchBrake
@@ -1041,6 +1438,6 @@ while true do
     -- Throttle the monitor redraw (~4 Hz) so the fast loop does not flicker
     if now - lastDisplayAt >= 0.25 then
         lastDisplayAt = now
-        updateDisplay(setSpeed, actualSpeed, driveOut, brakeOut, revOut, level, role, fault, redActive)
+        updateDisplay(setSpeed, actualSpeed, driveOut, brakeOut, revOut, level, role, fault, redDist)
     end
 end
