@@ -68,6 +68,38 @@ else
 end
 
 -- ============================================================
+-- 0b2. Stress gauge (optional Create_Stressometer peripheral)
+-- ============================================================
+-- The drive command is ALSO the kinetic stress draw of the network:
+--   actual SU = |setMaxStress| * |multiplier| * |network RPM|
+-- (the multiplier is locked at 1 a few lines above). Once the summed SU of
+-- every member exceeds the capacity, Create marks the whole network
+-- overstressed and KineticBlockEntity.getSpeed() returns 0: the bogey then
+-- produces NO force at all, not less force. The guard below caps the
+-- commanded drive so the network is pulled back inside its capacity.
+-- Without a stressometer peripheral everything here is a no-op.
+local stressGauges = {}
+for _, name in ipairs(peripheral.getNames()) do
+    if peripheral.getType(name) == "Create_Stressometer" then
+        stressGauges[#stressGauges + 1] = peripheral.wrap(name)
+    end
+end
+if #stressGauges > 0 then
+    print("Stress gauge found: " .. #stressGauges .. " - overstress guard ACTIVE")
+else
+    print("No Create_Stressometer peripheral - overstress guard disabled")
+end
+
+local STRESS_GUARD_MARGIN        = cfg.stressGuardMargin or 0.95
+local STRESS_GUARD_RELEASE_RATIO = cfg.stressGuardReleaseRatio or 0.85
+local STRESS_GUARD_RELEASE       = cfg.stressGuardRelease or 8.0
+local STRESS_GUARD_CAL_ABORT     = cfg.stressGuardCalibAbort ~= false
+local stressGuardLimit  = DRIVE_STRESS_MAX  -- drive strength allowed right now
+local stressGuardLast   = 0                 -- drive strength actually sent last tick
+local stressGuardActive = false             -- clamped on the previous tick
+local stressGuardHold   = 0                 -- s: ceiling frozen after a clamp
+
+-- ============================================================
 -- 0c. Red-signal protection source (bogey probe, fixed axle)
 -- ============================================================
 -- The Simurail bogey probe walks the track graph ahead of an axle and caches
@@ -329,6 +361,76 @@ local function setReverseGearbox(activate)
     revSign = activate and -1 or 1
 end
 
+-- ============================================================
+-- Overstress guard (driver side; see the 0b2 scan above)
+-- ============================================================
+-- Called once per main-loop tick. While a stressometer reports
+-- used > capacity, the drive ceiling is snapped down to
+-- lastSent * (capacity / used) * margin. The stress draw scales linearly
+-- with the drive strength (multiplier locked at 1), so that ratio is exactly
+-- what puts the network back under its capacity.
+-- The ceiling is only released again while the gauge shows used/capacity
+-- below a WIDE safe band (STRESS_GUARD_RELEASE_RATIO, not the cut margin).
+-- A narrow or free release makes the guard pump itself: the stressometer
+-- reports the network's cached value, so the reading trails the command by a
+-- tick or three - release fast, react late, overshoot, cut, repeat. The wide
+-- band plus a slow release keeps the loop stable and parks the drive just
+-- under what the network can take.
+-- Braking is not affected: the brake force has no stress term, so a capped
+-- drive never costs stopping power.
+local STRESS_GUARD_HOLD = 0.3   -- s: no ceiling movement after a clamp
+local function updateStressGuard(dt)
+    if #stressGauges == 0 then return end
+
+    local valid, worst, scale = false, 0, nil
+    local usedW, capW = 0, 0
+    for _, g in ipairs(stressGauges) do
+        local okU, u = pcall(g.getStress)
+        local okC, c = pcall(g.getStressCapacity)
+        if okU and okC and type(u) == "number" and type(c) == "number" then
+            valid = true
+            -- Same test Create uses: overstressed when capacity < stress.
+            -- A network at rest reports 0/0: no load, no capacity, no clamp.
+            local r = (c > 0) and (u / c) or ((u > 0) and math.huge or 0)
+            if r > worst then
+                worst, usedW, capW = r, u, c
+            end
+            if u > c then
+                local s = (c > 0) and (c / u) or 0
+                if not scale or s < scale then scale = s end
+            end
+        end
+    end
+    if not valid then return end
+
+    if scale then
+        local target = stressGuardLast * scale * STRESS_GUARD_MARGIN
+        if target < stressGuardLimit then stressGuardLimit = target end
+        if not stressGuardActive then
+            stressGuardActive = true
+            print(string.format("STRESS GUARD: network overstressed (%.0f/%.0f) - drive capped to %.0f",
+                usedW, capW, stressGuardLimit))
+        end
+        stressGuardHold = STRESS_GUARD_HOLD
+        return
+    end
+
+    -- Let the reading catch up with the last cut before deciding anything
+    if stressGuardHold > 0 then
+        stressGuardHold = stressGuardHold - dt
+        return
+    end
+
+    if stressGuardActive then
+        stressGuardActive = false
+        print("STRESS GUARD: back within capacity - releasing the drive cap")
+    end
+    if worst < STRESS_GUARD_RELEASE_RATIO and stressGuardLimit < DRIVE_STRESS_MAX then
+        stressGuardLimit = math.min(DRIVE_STRESS_MAX,
+            stressGuardLimit + STRESS_GUARD_RELEASE * dt)
+    end
+end
+
 -- Set throttle output; throttleInput is drive stress 0..DRIVE_STRESS_MAX
 -- (bogey setMaxStress). revSign picks the direction, and the change-only
 -- cache stores the SIGNED value so a direction flip with an unchanged
@@ -337,6 +439,9 @@ end
 -- the gearbox / kinetic network, which must be fed by constant redstone.
 local function setThrottleOutput(throttleInput)
     local out = math.max(0, math.min(DRIVE_STRESS_MAX, throttleInput))
+    -- Overstress guard: never command more drive than the network can take
+    if out > stressGuardLimit then out = stressGuardLimit end
+    stressGuardLast = out
     local signed = revSign * out
     for _, p in ipairs(bogeys) do
         local last = lastSentStress[p]
@@ -1183,6 +1288,9 @@ while true do
     if dt <= 0 then dt = 0.001 end
     if dt > 0.5 then dt = 0.5 end
 
+    -- Overstress guard: refresh the allowed drive strength for this tick
+    updateStressGuard(dt)
+
     -- Lever mode (re-read every tick; can change while running)
     local leverSig = redstone.getAnalogInput(SIDE_REVERSE) or 0
     local role, masterReverse = leverMode(leverSig)
@@ -1309,6 +1417,13 @@ while true do
         elseif redTooClose or not sensor then
             print("CALIB ABORTED: " .. (not sensor and "velocity sensor lost"
                 or string.format("red signal %.0f blocks ahead", redDist)))
+            calib = nil
+            calibHold = true
+        end
+        if calib and stressGuardActive and STRESS_GUARD_CAL_ABORT then
+            -- A clamped drive is not full traction, so the fitted accel curve
+            -- would be wrong: treat it like the other calibration aborts.
+            print("CALIB ABORTED: stress guard active - traction was not at full strength")
             calib = nil
             calibHold = true
         end

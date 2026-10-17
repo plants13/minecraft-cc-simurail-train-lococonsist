@@ -122,4 +122,19 @@ return {
     -- peripheral. The red signal ahead comes from the bogey probe (see the
     -- redProbe* settings above), not from a redstone input.
     bogeyDriveMax = 128.0,       -- drive stress range: PID output 0..128 -> setMaxStress +/-128 (kinetic stress draw)
+
+    -- ---- Overstress guard (optional Create_Stressometer peripheral) ----
+    -- The drive strength (setMaxStress) IS the kinetic stress draw, so a drive
+    -- command above the network's capacity makes Create mark the network
+    -- overstressed: getSpeed() returns 0 and the bogeys lose ALL traction.
+    -- When a stressometer reports used > capacity the script snaps the drive
+    -- ceiling down by capacity/used, holds it, then releases it slowly - only
+    -- while the network sits inside a wide safe band. The band matters: the
+    -- stressometer reading lags the command, and a narrow release band makes
+    -- the guard pump itself and the train stutter. No stressometer peripheral
+    -- -> the whole guard is inactive.
+    stressGuardMargin       = 0.95,  -- cut the drive to this fraction of capacity
+    stressGuardReleaseRatio = 0.85,  -- release the cap only while used/capacity < this
+    stressGuardRelease      = 8.0,   -- cap recovery rate (units/s on the 0..128 scale)
+    stressGuardCalibAbort   = true,  -- abort a calibration run if the guard clamps (traction not full)
 }
