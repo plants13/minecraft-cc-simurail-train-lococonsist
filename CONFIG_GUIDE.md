@@ -113,6 +113,8 @@ return {
 - **外设调用节流**：驱动/制动只在数值变化时才调用外设（防 mainThread 任务拖垮主循环）；驱动缓存记录的是**带符号**应力，所以换向时即使幅值没变也会重新下发。重启后外设数值复位，无需额外同步。
 - **外设缺失**：启动扫描不到 `Simurail_PhysicsBogey` 时只打印 `ERROR: no Simurail_PhysicsBogey peripheral - this vehicle cannot drive or brake`，此时车**既不能牵引也不能制动**（无红石回退），先查接线/区块加载再动车。
 - 转向架 GUI 里的"应力"就是 maxStress 基数——CC 设置的倍率不显示在 GUI，用 `hasStressMultiplierOverride()`/`getStressMultiplier()` 判断。
+- **超载保护（可选外设 `Create_Stressometer`）**：驱动强度同时就是网络应力消耗，`Σ|maxStress|×|multiplier|×|网络RPM|` 一旦超过产能，Create 把整条网络判为 overstressed、`getSpeed()` 返回 0，转向架**牵引力整体归零**（不是变小，是归零——油门越大越死）。脚本每拍读一次应力表：`used > capacity` 时把驱动上限压到 `当前值 × capacity/used × stressGuardMargin`，之后冻结 0.3 s，再仅在 `used/capacity < stressGuardReleaseRatio`（默认 0.85，宽回差）时按 `stressGuardRelease`（默认 8/s）慢慢放回。**没有应力表外设时整段逻辑不生效**，行为与接入前完全一致。制动不受影响（制动力公式里没有应力项），压驱动不会削弱停车能力。标定运行中触发保护会按 `stressGuardCalibAbort` 中止——那时不是全牵引，拟合出的加速度曲线不可信。
+- 应力表必须接在**被这些转向架消耗的同一条动力网络**上，并且电脑能通过相邻面或同一有线网络看到它（脚本用 `peripheral.getNames()` 扫，和找转向架的方式一样）。
 
 ---
 
@@ -234,6 +236,7 @@ return {
 | 收不到对方（无 Heard / RX 不涨） | 组内 protocol 不一致 | 两台 `protocol` 逐字符对比；控制台 `Foreign protocol` 会指出差异 |
 | 全列 EB（FAULT） | 组内主机数 ≠ 1（都中立/多台非中立） | 确认恰好一台拉杆在前进/后退 |
 | 车完全不动（bogey 模式） | ① 变速箱没转速（常亮红石缺失）② 转向架 maxStress 为 0 ③ 外设根本没找到 | ① 变速箱接常亮红石 ② `bogey_probe.lua` 查 `getMaxStress` ③ 控制台 `ERROR: no Simurail_PhysicsBogey peripheral` |
+| 显示器 `T:` 有数值、车却不动或一顿一顿 | 动力网络 overstressed：`getSpeed()` 被清零，牵引力整体为 0 | 接 `Create_Stressometer` 看 `used/capacity`；控制台出现 `STRESS GUARD:` 就是保护在介入，调小 `bogeyDriveMax` 或加大动力产能（多并电机/提高转速） |
 | 显示器 `T:` 无变化 | 驱动应力未变或外设失联 | 控制台 `BOGEY CALL FAILED` 提示；`bogey_probe.lua` 单测 |
 | 倒车被红灯挡住 | 探针轴固定在转向架一端，倒车时朝车尾 | 拉杆 11-15 时保护整体豁免（靠目视）；倒车也要保护得改成按行驶方向选轴 |
 | 前进时保护方向反了（对后方红灯制动 / 前方红灯不动作） | `redProbeFront` 与实际行驶方向相反（纹理方向标识容易看反） | 取反 `redProbeFront`；用 `bogey_probe.lua` 对比两轴 `trackDir` 与行驶方向 |
