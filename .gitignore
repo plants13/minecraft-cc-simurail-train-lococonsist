@@ -5,8 +5,11 @@
 # 导致 tcc/ 与 tools/ 长期处于无版本保护状态。现已迁移到本文件。
 
 # ---- 第三方模组源码：体积大，仅供反查 API，需要时从官方仓库重新获取 ----
+# Create-Simurail/ 是上游仓库的 clone（自带 .git，可直接 pull）；
+# Create-Simurail-20260825-snapshot/ 是更新前的旧快照，两者都不入库。
 Create-mc1.21.1-dev/
-Create-Simurail-main/
+Create-Simurail/
+Create-Simurail-20260825-snapshot/
 Railway-1.21.1-1.21-dev/
 *.zip
 
@@ -35,3 +38,7 @@ NUL;
 .idea/
 Thumbs.db
 desktop.ini
+
+# ---- Node 依赖（tcc/ 是零依赖的，这里只是防止误装到仓库根） ----
+node_modules/
+package-lock.json
