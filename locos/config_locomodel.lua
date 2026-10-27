@@ -1,6 +1,9 @@
--- config_swd1p.lua
--- Locomotive configuration file for SWD1P
--- Edit this file to change locomotive parameters
+-- config_locomodel.lua
+-- Generic locomotive configuration file (one per locomotive).
+-- Edit this file to change locomotive parameters.
+-- The file name is up to you: startup.lua loads it with
+--   local cfg = dofile("config_locomodel.lua")
+-- so keep that line in sync if you rename this file.
 
 return {
     -- ---- Maximum operating speed (m/s) ----

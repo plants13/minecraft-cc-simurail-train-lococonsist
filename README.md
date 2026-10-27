@@ -1,5 +1,13 @@
 # 机车重联控制系统（CC:Tweaked）
 
+> **第一约束（人和其他在此目录工作的 AI 工具都适用）**
+> 所有 `.lua` 脚本与游戏内配置文件**必须纯 ASCII**。CC:Tweaked 加载不了含非 ASCII 字符的脚本，
+> 出现一个中文注释，电脑开机就报错。中文说明只写在本仓库的 `.md` / `.txt` 文档里，
+> 这些文档不要复制进游戏电脑。
+> 另：`backup_pre_*` 未纳入版本管理，其中 `locomaster.lua` / `locoslave.lua`（合并前的双脚本架构）
+> 从未进入过 git 历史，是唯一副本，请勿清理。里面的 `config_yl56u2.lua` 已被通用的
+> `config_locomodel.lua` 取代，没有保留价值。
+
 Minecraft **CC:Tweaked** 物理化列车（**Simurail** 物理转向架）重联控制系统：单脚本主机/从机合一，换向拉杆选角色；PID 闭环驾驶、重联编组、冒进防护、性能标定一体。
 
 ---

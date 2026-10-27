@@ -1,0 +1,410 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>列车控制中心 · 线路预览与限速编辑</title>
+<style>
+  :root { --bg:#0f1419; --panel:#161d26; --panel2:#1c2530; --line:#2a3644; --txt:#dbe4ee; --dim:#8aa0b5;
+          --green:#3ddc84; --yellow:#f5c542; --orange:#ffa040; --red:#ff5d5d; --cyan:#38c7d0; }
+  * { box-sizing:border-box; margin:0; padding:0; }
+  body { background:var(--bg); color:var(--txt); font-family:"Microsoft YaHei","PingFang SC",sans-serif; font-size:13px; }
+  #top { display:flex; gap:16px; align-items:baseline; padding:8px 14px; border-bottom:1px solid var(--line); flex-wrap:wrap; }
+  #top h1 { font-size:16px; }
+  .mono { font-family:Consolas,Menlo,monospace; font-size:12px; }
+  .dim { color:var(--dim); }
+  #ws { color:var(--dim); }
+  #ws.on { color:var(--green); }
+  #ws.off { color:var(--red); }
+  #toolbar { display:flex; gap:10px; align-items:center; padding:6px 14px; border-bottom:1px solid var(--line); background:var(--panel); flex-wrap:wrap; }
+  input[type=number] { width:64px; background:#243140; color:var(--txt); border:1px solid var(--line); border-radius:4px; padding:2px 4px; }
+  textarea { width:100%; height:52px; background:#0b1016; color:var(--txt); border:1px solid var(--line); border-radius:4px; padding:4px; font-size:12px; resize:vertical; }
+  button { background:#243140; color:var(--txt); border:1px solid var(--line); border-radius:5px; padding:3px 10px; cursor:pointer; }
+  button:hover { background:#2e3f52; }
+  #wrap { position:relative; }
+  canvas { display:block; width:100vw; height:calc(100vh - 96px); cursor:grab; }
+  canvas.drag { cursor:grabbing; }
+  #legend { position:absolute; right:10px; top:10px; background:rgba(13,18,24,.85); border:1px solid var(--line); border-radius:6px; padding:8px 10px; font-size:12px; }
+  #legend .sw { display:inline-block; width:22px; height:4px; margin-right:6px; vertical-align:middle; }
+  #sel { color:var(--yellow); }
+  #noteBox { display:none; border-left:1px solid var(--line); padding-left:10px; }
+</style>
+</head>
+<body>
+<div id="top">
+  <h1>列车控制中心</h1>
+  <span id="ws">WebSocket: 连接中…</span>
+  <span class="mono dim" id="graph"></span>
+  <span class="dim" id="stats"></span>
+</div>
+<div id="toolbar">
+  <span class="dim">线路</span>
+  <select id="graphSel"></select>
+  <input id="graphName" placeholder="图名" maxlength="30" style="width:96px">
+  <button id="btnRename">改名</button>
+  <label style="cursor:pointer"><input type="checkbox" id="showEmpty"> 显示空图</label>
+  <span class="sep" style="color:var(--line)">│</span>
+  <span class="dim">默认限速</span>
+  <input id="defLimit" type="number" min="0" max="400" step="5" value="120">
+  <span class="dim">km/h</span>
+  <button id="btnDef">应用默认</button>
+  <span class="sep" style="color:var(--line)">│</span>
+  <span class="dim">选中</span>
+  <span id="sel" class="mono">—</span>
+  <span id="limitBox" style="display:none">
+    限速 <input id="edgeLimit" type="number" min="0" max="400" step="5"> km/h
+    <button id="btnEdge">应用</button>
+    <button id="btnClear">恢复默认</button>
+  </span>
+  <span id="noteBox">
+    <span class="dim">备注</span>
+    <textarea id="noteText" placeholder="输入备注…"></textarea>
+    <button id="btnNote">保存备注</button>
+  </span>
+  <span class="dim" style="margin-left:auto">拖拽平移 · 滚轮缩放 · 点击选中 · <b>Shift+点两条边选路径</b></span>
+</div>
+<div id="wrap">
+  <canvas id="map"></canvas>
+  <div id="legend">
+    <div><span class="sw" style="background:var(--green)"></span>≥100 km/h</div>
+    <div><span class="sw" style="background:var(--yellow)"></span>60-99</div>
+    <div><span class="sw" style="background:var(--orange)"></span>30-59</div>
+    <div><span class="sw" style="background:var(--red)"></span>&lt;30</div>
+    <div><span class="sw" style="background:#4a5560"></span>未设置(默认)</div>
+    <div style="margin-top:6px"><span style="color:var(--red)">●</span> 信号 <span style="color:var(--yellow)">●</span> 站台 <span style="color:var(--cyan)">·</span> 有备注</div>
+  </div>
+</div>
+
+<script>
+"use strict";
+const $ = id => document.getElementById(id);
+const canvas = $('map'), ctx = canvas.getContext('2d');
+
+let line = null, edgePaths = [], nodeById = new Map(), limits = null, notes = { signals: {}, stations: {} };
+let selected = null, pathStart = null;   // selected: {kind:'edge'|'path'|'station'|'signal', ...}
+let curGraph = null;
+const view = { scale: 1, ox: 0, oz: 0 };
+
+// ---------- WebSocket ----------
+let ws = null;
+function setWs(txt, cls) { const el = $('ws'); el.textContent = 'WebSocket: ' + txt; el.className = cls || ''; }
+function connect() {
+  ws = new WebSocket('ws://' + location.host);
+  ws.onopen = () => { setWs('已连接', 'on'); ws.send(JSON.stringify({ type: 'getGraphs' })); ws.send(JSON.stringify({ type: 'get' })); };
+  ws.onmessage = ev => {
+    let m; try { m = JSON.parse(ev.data); } catch (e) { return; }
+    if (m.type === 'graphs') onGraphs(m.graphs);
+    else if (m.type === 'line') onLine(m.line, m.notes, m.graph);
+    else if (m.type === 'limits') onLimits(m);
+    else if (m.type === 'notes') onNotes(m);
+  };
+  ws.onclose = () => { setWs('断开，2s 后重连…', 'off'); setTimeout(connect, 2000); };
+  ws.onerror = () => ws.close();
+}
+function send(obj) { if (ws && ws.readyState === 1) ws.send(JSON.stringify(obj)); }
+
+// ---------- 数据处理 ----------
+const keyOf = e => (e.from < e.to ? e.from + '|' + e.to : e.to + '|' + e.from);
+const norm = v => { const l = Math.hypot(v.x, v.y, v.z); return l ? { x: v.x / l, y: v.y / l, z: v.z / l } : { x: 0, y: 0, z: 0 }; };
+const add = (a, b) => ({ x: a.x + b.x, y: a.y + b.y, z: a.z + b.z });
+const scale = (a, k) => ({ x: a.x * k, y: a.y * k, z: a.z * k });
+function bez(p0, c0, c1, p1, t) {
+  const u = 1 - t, a = u * u * u, b = 3 * u * u * t, c = 3 * u * t * t, d = t * t * t;
+  return { x: a * p0.x + b * c0.x + c * c1.x + d * p1.x, z: a * p0.z + b * c0.z + c * c1.z + d * p1.z };
+}
+function sampleCurve(curve, n = 16) {
+  const p0 = curve.starts[0], p1 = curve.starts[1];
+  const a1 = norm(curve.axes[0]), a2 = norm(curve.axes[1]);
+  const dot = a1.x * a2.x + a1.y * a2.y + a1.z * a2.z;
+  const angle = Math.acos(Math.max(-1, Math.min(1, dot)));
+  const d = Math.hypot(p1.x - p0.x, p1.y - p0.y, p1.z - p0.z);
+  const h = angle < 1e-4 ? d / 3 : (d / (2 * Math.sin(angle / 2))) * (4 / 3) * Math.tan(Math.PI / (2 * (2 * Math.PI / angle)));
+  const c0 = add(p0, scale(a1, h)), c1 = add(p1, scale(a2, h));
+  const pts = [];
+  for (let i = 0; i <= n; i++) pts.push(bez(p0, c0, c1, p1, i / n));
+  return pts;
+}
+
+let edgeByKey = new Map();
+function onLine(l, nt) {
+  line = l;
+  curGraph = nt ? l.graph : curGraph;   // graph id from the server
+  notes = nt || notes;
+  nodeById = new Map(l.nodes.map(n => [n.id, n]));
+  edgePaths = l.edges.map(e => ({ e, pts: e.curve ? sampleCurve(e.curve) : [nodeById.get(e.from), nodeById.get(e.to)] }));
+  edgeByKey = new Map(edgePaths.map(ep => [keyOf(ep.e), ep]));
+  buildAdj();   // 路径查找邻接表（必须构建！）
+  $('graph').textContent = 'graph: ' + l.graph;
+  $('graphSel').value = l.graph;
+  $('graphName').value = nameOf(l.graph) || l.line;
+  updateStats();
+  fit();
+  draw();
+}
+let graphsAll = [], showEmpty = false;
+function nameOf(id) { const g = graphsAll.find(x => x.id === id); return g ? g.name : ''; }
+function rebuildSel() {
+  const sel = $('graphSel');
+  const cur = sel.value || curGraph || '';
+  const shown = graphsAll.filter(g => showEmpty || g.signals > 0 || g.stations > 0 || g.id === curGraph);
+  sel.innerHTML = shown.map(g =>
+    '<option value="' + g.id + '">' + g.name + ' (' + g.nodes + '节点/' + g.signals + '信号/' + g.stations + '站台)</option>').join('');
+  if (shown.some(g => g.id === cur)) sel.value = cur;
+  else if (shown.length) sel.value = shown[0].id;
+  $('graphName').value = nameOf(sel.value);
+}
+function onGraphs(list) {
+  graphsAll = list;
+  rebuildSel();
+}
+function onLimits(m) {
+  if (m.graph !== curGraph) return;
+  limits = m;
+  $('defLimit').value = m.defaultLimit;
+  for (const e of line.edges) e.limit = m.edges[keyOf(e)] ?? m.defaultLimit;
+  draw();
+}
+function onNotes(m) {
+  if (m.graph !== curGraph) return;
+  notes = m;
+  draw();
+}
+function updateStats() {
+  $('stats').textContent = `节点 ${line.nodes.length} · 边 ${line.edges.length} · 信号 ${line.signals.length} · 站台 ${line.stations.length}`;
+}
+
+// ---------- 路径查找（Dijkstra） ----------
+let adj = new Map();
+function buildAdj() {
+  adj = new Map();
+  for (const ep of edgePaths) {
+    const k = keyOf(ep.e);
+    for (const [a, b] of [[ep.e.from, ep.e.to], [ep.e.to, ep.e.from]]) {
+      if (!adj.has(a)) adj.set(a, []);
+      adj.get(a).push({ to: b, key: k, len: ep.e.length });
+    }
+  }
+}
+function dijkstraKeys(start, goal) {
+  const dist = new Map([[start, 0]]);
+  const prev = new Map();
+  const done = new Set();
+  for (;;) {
+    let cur = null, best = Infinity;
+    for (const [n, d] of dist) if (!done.has(n) && d < best) { best = d; cur = n; }
+    if (cur === null || cur === goal) break;
+    done.add(cur);
+    for (const e of adj.get(cur) || []) {
+      const nd = dist.get(cur) + e.len;
+      if (nd < (dist.get(e.to) ?? Infinity)) { dist.set(e.to, nd); prev.set(e.to, { from: cur, key: e.key }); }
+    }
+  }
+  if (start !== goal && !prev.has(goal)) return null;
+  const keys = [];
+  let n = goal;
+  while (n !== start) { const p = prev.get(n); if (!p) return null; keys.push(p.key); n = p.from; }
+  return keys;
+}
+function findPath(edgeA, edgeB) {
+  let best = null;
+  for (const s of [edgeA.e.from, edgeA.e.to])
+    for (const g of [edgeB.e.from, edgeB.e.to]) {
+      const keys = dijkstraKeys(s, g);
+      if (!keys) continue;
+      const total = edgeA.e.length + edgeB.e.length + keys.reduce((a, k) => a + (edgeByKey.get(k) ? edgeByKey.get(k).e.length : 0), 0);
+      if (!best || total < best.total) best = { keys, total };
+    }
+  if (!best) return null;
+  const set = new Set([keyOf(edgeA.e), keyOf(edgeB.e), ...best.keys]);
+  return set;
+}
+
+// ---------- 视图 / 绘制 ----------
+function fit() {
+  let minX = Infinity, maxX = -Infinity, minZ = Infinity, maxZ = -Infinity;
+  for (const n of line.nodes) { minX = Math.min(minX, n.x); maxX = Math.max(maxX, n.x); minZ = Math.min(minZ, n.z); maxZ = Math.max(maxZ, n.z); }
+  const W = canvas.width, H = canvas.height, pad = 60;
+  view.scale = Math.min((W - pad * 2) / (maxX - minX || 1), (H - pad * 2) / (maxZ - minZ || 1));
+  view.ox = (minX + maxX) / 2 - W / (2 * view.scale);
+  view.oz = (minZ + maxZ) / 2 - H / (2 * view.scale);
+}
+const w2x = x => (x - view.ox) * view.scale;
+const w2z = z => (z - view.oz) * view.scale;
+
+function limitColor(v) {
+  if (v == null) return '#4a5560';
+  if (v >= 100) return '#3ddc84';
+  if (v >= 60) return '#f5c542';
+  if (v >= 30) return '#ffa040';
+  return '#ff5d5d';
+}
+function isSelKey(k) {
+  if (!selected) return false;
+  if (selected.kind === 'edge') return selected.key === k;
+  if (selected.kind === 'path') return selected.keys.has(k);
+  return false;
+}
+
+function draw() {
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  ctx.fillStyle = '#0b1016'; ctx.fillRect(0, 0, canvas.width, canvas.height);
+  if (!line) return;
+  // edges
+  for (const ep of edgePaths) {
+    const k = keyOf(ep.e);
+    const sel = isSelKey(k), start = pathStart && keyOf(pathStart) === k;
+    ctx.strokeStyle = sel ? '#ffffff' : start ? '#ffa040' : limitColor(ep.e.limit);
+    ctx.lineWidth = sel || start ? 3 : 1.4;
+    ctx.beginPath();
+    ep.pts.forEach((p, i) => { const sx = w2x(p.x), sy = w2z(p.z); i ? ctx.lineTo(sx, sy) : ctx.moveTo(sx, sy); });
+    ctx.stroke();
+  }
+  // signals
+  ctx.fillStyle = '#ff5d5d';
+  for (const s of line.signals) {
+    const sx = w2x(s.pos.x), sy = w2z(s.pos.z);
+    ctx.beginPath(); ctx.arc(sx, sy, 3, 0, 7); ctx.fill();
+    if (notes.signals[s.id]) { ctx.strokeStyle = '#38c7d0'; ctx.lineWidth = 1.5; ctx.beginPath(); ctx.arc(sx, sy, 5, 0, 7); ctx.stroke(); }
+  }
+  // stations
+  ctx.fillStyle = '#f5c542';
+  ctx.font = '11px sans-serif';
+  for (const st of line.stations) {
+    const sx = w2x(st.pos.x), sy = w2z(st.pos.z);
+    ctx.beginPath(); ctx.arc(sx, sy, 4, 0, 7); ctx.fill();
+    if (notes.stations[st.id]) { ctx.strokeStyle = '#38c7d0'; ctx.lineWidth = 1.5; ctx.beginPath(); ctx.arc(sx, sy, 6, 0, 7); ctx.stroke(); }
+    if (view.scale > 0.1 && st.name) ctx.fillText(st.name, sx + 6, sy - 5);
+  }
+  // selected marker highlight
+  if (selected && (selected.kind === 'station' || selected.kind === 'signal')) {
+    const p = selected.kind === 'station' ? selected.st.pos : selected.s.pos;
+    ctx.strokeStyle = '#ffffff'; ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.arc(w2x(p.x), w2z(p.z), 8, 0, 7); ctx.stroke();
+  }
+}
+
+// ---------- 交互：平移 / 缩放 / 点选 ----------
+let drag = null;
+function resize() {
+  canvas.width = window.innerWidth;
+  canvas.height = window.innerHeight - 96;
+  if (line) draw();
+}
+window.addEventListener('resize', resize);
+resize();
+
+canvas.addEventListener('mousedown', ev => {
+  drag = { x: ev.clientX, y: ev.clientY, ox: view.ox, oz: view.oz, moved: 0 };
+  canvas.classList.add('drag');
+});
+window.addEventListener('mousemove', ev => {
+  if (!drag) return;
+  drag.moved += Math.abs(ev.clientX - drag.x) + Math.abs(ev.clientY - drag.y);
+  view.ox = drag.ox - (ev.clientX - drag.x) / view.scale;
+  view.oz = drag.oz - (ev.clientY - drag.y) / view.scale;
+  draw();
+});
+window.addEventListener('mouseup', ev => {
+  if (!drag) return;
+  const moved = drag.moved;
+  drag = null;
+  canvas.classList.remove('drag');
+  if (moved > 5) return;
+  const r = canvas.getBoundingClientRect();
+  pickAt(ev.clientX - r.left, ev.clientY - r.top, ev.shiftKey);
+});
+canvas.addEventListener('wheel', ev => {
+  ev.preventDefault();
+  const r = canvas.getBoundingClientRect();
+  const mx = ev.clientX - r.left, my = ev.clientY - r.top;
+  const k = ev.deltaY < 0 ? 1.2 : 1 / 1.2;
+  const wx = mx / view.scale + view.ox, wz = my / view.scale + view.oz;
+  view.scale *= k;
+  view.ox = wx - mx / view.scale;
+  view.oz = wz - my / view.scale;
+  draw();
+}, { passive: false });
+
+function segDist2(px, pz, a, b) {
+  const dx = b.x - a.x, dz = b.z - a.z;
+  const len2 = dx * dx + dz * dz;
+  let t = len2 ? ((px - a.x) * dx + (pz - a.z) * dz) / len2 : 0;
+  t = Math.max(0, Math.min(1, t));
+  const qx = a.x + t * dx, qz = a.z + t * dz;
+  return (px - qx) ** 2 + (pz - qz) ** 2;
+}
+function nearestEdge(wx, wz) {
+  let best = null, bestD = (12 / view.scale) ** 2;
+  for (const ep of edgePaths)
+    for (let i = 0; i < ep.pts.length - 1; i++) {
+      const d = segDist2(wx, wz, ep.pts[i], ep.pts[i + 1]);
+      if (d < bestD) { bestD = d; best = ep; }
+    }
+  return best ? best.e : null;
+}
+function pickAt(mx, my, shift) {
+  const wx = mx / view.scale + view.ox, wz = my / view.scale + view.oz;
+  // 先查信号/站台标记
+  for (const st of line.stations) if ((wx - st.pos.x) ** 2 + (wz - st.pos.z) ** 2 < (7 / view.scale) ** 2) { selected = { kind: 'station', st }; pathStart = null; updateSelPanel(); draw(); return; }
+  for (const s of line.signals) if ((wx - s.pos.x) ** 2 + (wz - s.pos.z) ** 2 < (6 / view.scale) ** 2) { selected = { kind: 'signal', s }; pathStart = null; updateSelPanel(); draw(); return; }
+  // 边
+  const e = nearestEdge(wx, wz);
+  if (!e) { selected = null; pathStart = null; updateSelPanel(); draw(); return; }
+  if (shift) {
+    if (!pathStart) { pathStart = e; selected = null; $('sel').textContent = '已选起点边 ' + keyOf(e) + '，再 Shift+点终点边'; draw(); return; }
+    const keys = findPath({ e: pathStart }, { e });
+    pathStart = null;
+    if (!keys) { $('sel').textContent = '两条边不连通'; selected = null; }
+    else selected = { kind: 'path', keys };
+  } else {
+    pathStart = null;
+    selected = { kind: 'edge', key: keyOf(e), e };
+  }
+  updateSelPanel();
+  draw();
+}
+function updateSelPanel() {
+  const lim = $('limitBox'), note = $('noteBox');
+  lim.style.display = 'none'; note.style.display = 'none';
+  if (!selected) { $('sel').textContent = '—'; return; }
+  if (selected.kind === 'edge') {
+    $('sel').textContent = `${selected.e.from}→${selected.e.to} · ${selected.e.kind} · ${selected.e.length}m`;
+    $('edgeLimit').value = selected.e.limit ?? ''; lim.style.display = 'inline';
+  } else if (selected.kind === 'path') {
+    $('sel').textContent = `路径 ${selected.keys.size} 条边`;
+    $('edgeLimit').value = ''; lim.style.display = 'inline';
+  } else if (selected.kind === 'station') {
+    $('sel').textContent = `站台 ${selected.st.name || selected.st.id} · d=${selected.st.d}m`;
+    $('noteText').value = notes.stations[selected.st.id] || ''; note.style.display = 'inline';
+  } else if (selected.kind === 'signal') {
+    $('sel').textContent = `信号 ${selected.s.id} · d=${selected.s.d}m`;
+    $('noteText').value = notes.signals[selected.s.id] || ''; note.style.display = 'inline';
+  }
+}
+
+// ---------- 编辑 ----------
+$('graphSel').onchange = () => { selected = null; pathStart = null; updateSelPanel(); send({ type: 'get', graph: $('graphSel').value }); };
+$('btnRename').addEventListener('click', () => send({ type: 'setGraphName', graph: curGraph, name: $('graphName').value }));
+$('showEmpty').addEventListener('change', () => { showEmpty = $('showEmpty').checked; rebuildSel(); });
+$('btnDef').addEventListener('click', () => send({ type: 'setDefaultLimit', graph: curGraph, limit: Number($('defLimit').value) }));
+$('btnEdge').addEventListener('click', () => {
+  if (!selected) return;
+  const v = Number($('edgeLimit').value);
+  if (selected.kind === 'edge') send({ type: 'setEdgeLimit', graph: curGraph, from: selected.e.from, to: selected.e.to, limit: v });
+  else if (selected.kind === 'path') for (const k of selected.keys) { const [a, b] = k.split('|'); send({ type: 'setEdgeLimit', graph: curGraph, from: a, to: b, limit: v }); }
+});
+$('btnClear').addEventListener('click', () => {
+  if (!selected) return;
+  if (selected.kind === 'edge') send({ type: 'setEdgeLimit', graph: curGraph, from: selected.e.from, to: selected.e.to, limit: null });
+  else if (selected.kind === 'path') for (const k of selected.keys) { const [a, b] = k.split('|'); send({ type: 'setEdgeLimit', graph: curGraph, from: a, to: b, limit: null }); }
+});
+$('btnNote').addEventListener('click', () => {
+  if (!selected || (selected.kind !== 'station' && selected.kind !== 'signal')) return;
+  const kind = selected.kind, id = kind === 'station' ? selected.st.id : selected.s.id;
+  send({ type: 'setNote', graph: curGraph, kind, id, note: $('noteText').value });
+});
+
+connect();
+</script>
+</body>
+</html>

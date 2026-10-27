@@ -1,0 +1,37 @@
+# locoCtrl 忽略规则（随仓库分发）
+#
+# 迁移说明：此前规则写在 .git/info/exclude —— "忽略一切(/*) + 白名单放行"，
+# 那个文件是本地私有的，不随仓库走，其他在此目录工作的 AI 工具看不到它，
+# 导致 tcc/ 与 tools/ 长期处于无版本保护状态。现已迁移到本文件。
+
+# ---- 第三方模组源码：体积大，仅供反查 API，需要时从官方仓库重新获取 ----
+Create-mc1.21.1-dev/
+Create-Simurail-main/
+Railway-1.21.1-1.21-dev/
+*.zip
+
+# ---- Create 存档与派生数据（均可由 tools/ 重新生成） ----
+create_tracks.dat
+create_tracks_parsed.json
+line_*.json
+
+# ---- 本地历史快照与工具残留 ----
+# 注意：backup_pre_merge_0821/0823 里的 locomaster.lua / locoslave.lua（合并前的
+# 双脚本架构）从未进入过 git 历史，是唯一副本，磁盘上不要删。
+# 其中的 config_yl56u2.lua 已被通用 config_locomodel.lua 取代，无保留价值。
+backup_pre_*/
+.stale-backup/
+.reasonix/
+NUL;
+
+# ---- 历史会话导出（非源码，2.3MB） ----
+上个会话的内容.md
+
+# ---- AI 工作笔记（本地） ----
+.workbuddy/
+
+# ---- 编辑器 / 系统 ----
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini
