@@ -36,7 +36,7 @@ Minecraft **CC:Tweaked** 物理化列车（**Simurail** 物理转向架）重联
 | `locos/door_ctrl.lua` | 车门集控（独立电脑，每车一台，左右侧按重联朝向映射） |
 | `locos/bogey_probe.lua` | 转向架外设独立诊断脚本 |
 | `locos/depot_probe.lua` | 车库库存外设探测脚本 |
-| `tools/*.js` | 线路数据解析 + TCC 探针（依赖未入库的 `tcc/` 服务） |
+| `tools/*.js` | 线路数据解析 + TCC 探针（连 `tcc/` 服务用） |
 | `backup_pre_*` | 历史快照（合并前 / 转向架外设改造前 / 本次修复前） |
 | `CONFIG_GUIDE.md` | 配置与部署指南（中文） |
 | `系统工作原理.txt` | 系统工作原理综述（纯文本） |
