@@ -27,10 +27,10 @@ backup_pre_*/
 .reasonix/
 NUL;
 
-# ---- 历史会话导出（非源码，2.3MB） ----
-上个会话的内容.md
-
-# ---- AI 工作笔记（本地） ----
+# ---- 本地工作文档：本机要留，但不上 GitHub ----
+# HANDOFF.md 是跨 AI 工具（DSH / WorkBuddy）的上下文中继。DSH 直接读本目录，
+# 不需要进仓库；里面有本地路径与维护约定，也不适合公开。README 已不再指向它。
+HANDOFF.md
 .workbuddy/
 
 # ---- 编辑器 / 系统 ----
