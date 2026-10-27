@@ -140,4 +140,36 @@ return {
     stressGuardReleaseRatio = 0.85,  -- release the cap only while used/capacity < this
     stressGuardRelease      = 8.0,   -- cap recovery rate (units/s on the 0..128 scale)
     stressGuardCalibAbort   = true,  -- abort a calibration run if the guard clamps (traction not full)
+
+    -- ---- Wheel slip guard (traction only) ----
+    -- The Simurail peripheral exposes no wheel speed to CC (there is no
+    -- slipSpeed / getSpeed on it), so slip cannot be read as wheel-vs-ground.
+    -- It is INFERRED instead: at a given speed and a given drive stress the
+    -- calibrated curve says how hard the train should be pulling, so wheels
+    -- that spin up instead of pushing show up as an acceleration DEFICIT -
+    -- the commanded stress is there, the speed gain is not.
+    -- Only traction is guarded. Braking is never reduced: a false slip call
+    -- under braking would eat stopping distance, which is the one thing this
+    -- controller must not trade away. Uphill grades and heavy loads also
+    -- produce a deficit, so the threshold is deliberately low and this is a
+    -- comfort/equipment feature, not a safety function.
+    -- Needs calib.json (the accel fit) - without it the guard is inactive.
+    -- OFF by default: the expected acceleration comes from a curve that was
+    -- calibrated with one fixed consist. In locomotive-hauled operation the
+    -- cars are coupled and uncoupled constantly, so the real mass - and with
+    -- it the real acceleration - changes between runs while the calibration
+    -- does not. That mismatch is exactly what the guard reads as slip, so with
+    -- a moving consist it would cut traction on perfectly healthy wheels.
+    -- Turn it on only when the loco runs with a fixed consist (or re-run
+    -- CALIBRATE after every change in the train set), then tune slipGuardRatio
+    -- against the SLIP:0.xx readout on the status line.
+    slipGuardEnabled   = false,  -- false switches the whole guard off
+    slipGuardRatio     = 0.45,   -- measured/expected accel below this -> slipping
+    slipGuardMinSpeed  = 2.0,    -- m/s: below this the verdict is too noisy
+    slipGuardMinStress = 24.0,   -- drive stress: below this there is little to slip
+    slipGuardCut       = 0.55,   -- multiply the drive ceiling by this per detection
+    slipGuardFloor     = 32.0,   -- never cut the ceiling below this stress
+    slipGuardRelease   = 10.0,   -- ceiling recovery rate (units/s, 0..128 scale)
+    slipGuardHold      = 0.4,    -- s: no ceiling movement right after a cut
+    slipGuardFilter    = 0.30,   -- s: acceleration smoothing window (sensor noise)
 }

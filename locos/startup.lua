@@ -431,6 +431,111 @@ local function updateStressGuard(dt)
     end
 end
 
+-- ============================================================
+-- 0b3. Wheel slip guard (traction only, inferred from an accel deficit)
+-- ============================================================
+-- The Simurail peripheral exposes no wheel speed to CC (no slipSpeed, no
+-- getSpeed on it), so slip cannot be read as wheel-vs-ground. It is INFERRED
+-- instead: at a given speed and a given drive stress the calibrated curve
+-- says how hard the train should be pulling, so wheels that spin up instead
+-- of pushing show up as an acceleration DEFICIT - the commanded stress is
+-- there, the speed gain is not.
+--
+--   expected = accelAt(v) * (commandedStress / DRIVE_STRESS_MAX)
+--   slipping  when  measured / expected < SLIP_RATIO
+--
+-- The guard then lowers the drive ceiling exactly like the overstress guard
+-- does and lets it creep back up. It only ever touches traction: braking is
+-- never reduced, because a false slip call under braking would cost stopping
+-- distance, and that is the one thing this controller must not trade away.
+-- An uphill grade or a heavy load also produces a deficit, so the threshold
+-- is deliberately low and this is a comfort/equipment feature, not a safety
+-- function. Needs calib.json - without it this whole block is a no-op.
+local SLIP_ENABLED    = cfg.slipGuardEnabled ~= false
+local SLIP_RATIO      = cfg.slipGuardRatio     or 0.45
+local SLIP_MIN_SPEED  = cfg.slipGuardMinSpeed  or 2.0
+local SLIP_MIN_STRESS = cfg.slipGuardMinStress or 24.0
+local SLIP_CUT        = cfg.slipGuardCut       or 0.55
+local SLIP_FLOOR      = math.max(0, math.min(DRIVE_STRESS_MAX, cfg.slipGuardFloor or 32.0))
+local SLIP_RELEASE    = cfg.slipGuardRelease   or 10.0
+local SLIP_HOLD       = cfg.slipGuardHold      or 0.4
+local SLIP_FILTER     = cfg.slipGuardFilter    or 0.30
+
+local slipLimit  = DRIVE_STRESS_MAX  -- drive ceiling set by the slip guard
+local slipActive = false             -- slipping on the previous verdict
+local slipHold   = 0                 -- s: ceiling frozen right after a cut
+local slipPrevV  = nil               -- previous speed sample (m/s)
+local slipAccel  = nil               -- smoothed measured acceleration (m/s^2)
+local slipRatio  = nil               -- measured/expected, shown on the display
+
+local function slipRelease(dt)
+    if slipLimit < DRIVE_STRESS_MAX then
+        slipLimit = math.min(DRIVE_STRESS_MAX, slipLimit + SLIP_RELEASE * dt)
+        if slipLimit >= DRIVE_STRESS_MAX - 0.01 then
+            slipLimit = DRIVE_STRESS_MAX
+            if slipActive then
+                slipActive = false
+                print("SLIP GUARD: acceleration recovered - drive ceiling released")
+            end
+        end
+    end
+end
+
+-- v: measured speed (m/s). The commanded stress is taken from the value
+-- actually sent last tick (stressGuardLast), which is also what the
+-- overstress guard uses: a sensor reading always trails the command.
+local function updateSlipGuard(dt, v)
+    if not SLIP_ENABLED then return end
+    if not perf.accel then return end          -- no calibration, no prediction
+    if type(v) ~= "number" then return end
+
+    if slipPrevV ~= nil and dt > 0 then
+        local a = (v - slipPrevV) / dt
+        if slipAccel then
+            slipAccel = slipAccel + (a - slipAccel) * math.min(1, dt / SLIP_FILTER)
+        else
+            slipAccel = a
+        end
+    end
+    slipPrevV = v
+
+    if slipHold > 0 then
+        slipHold = slipHold - dt
+        return
+    end
+
+    local cmd = stressGuardLast or 0
+    local exp = accelAt(v)
+    -- Below the speed/stress floor the verdict is noise (a standing start
+    -- pulls hard against a curve that is least certain at v = 0).
+    if not exp or cmd < SLIP_MIN_STRESS or v < SLIP_MIN_SPEED then
+        slipRatio = nil
+        slipRelease(dt)
+        return
+    end
+    local expected = exp * (cmd / DRIVE_STRESS_MAX)
+    if expected <= 0.05 then
+        slipRatio = nil
+        slipRelease(dt)
+        return
+    end
+
+    slipRatio = (slipAccel or 0) / expected
+    if slipRatio < SLIP_RATIO then
+        local target = math.max(SLIP_FLOOR, slipLimit * SLIP_CUT)
+        if target < slipLimit then slipLimit = target end
+        if not slipActive then
+            slipActive = true
+            print(string.format(
+                "SLIP GUARD: accel %.2f vs expected %.2f m/s^2 at %.1f m/s - drive capped to %.0f",
+                slipAccel or 0, expected, v, slipLimit))
+        end
+        slipHold = SLIP_HOLD
+    else
+        slipRelease(dt)
+    end
+end
+
 -- Set throttle output; throttleInput is drive stress 0..DRIVE_STRESS_MAX
 -- (bogey setMaxStress). revSign picks the direction, and the change-only
 -- cache stores the SIGNED value so a direction flip with an unchanged
@@ -441,6 +546,8 @@ local function setThrottleOutput(throttleInput)
     local out = math.max(0, math.min(DRIVE_STRESS_MAX, throttleInput))
     -- Overstress guard: never command more drive than the network can take
     if out > stressGuardLimit then out = stressGuardLimit end
+    -- Slip guard: never command more drive than the wheels can put down
+    if out > slipLimit then out = slipLimit end
     stressGuardLast = out
     local signed = revSign * out
     for _, p in ipairs(bogeys) do
@@ -793,6 +900,14 @@ local function updateDisplay(setSpeed, actualSpeed, driveOut, brakeOut, reverse,
     if visualDriving then flags[#flags + 1] = "VIS" end
     if redLatch then flags[#flags + 1] = "LAT" end
     if calibArmed then flags[#flags + 1] = "ARM" end
+    if slipActive then
+        -- ratio shown as well: it is the number you tune slipGuardRatio against
+        if slipRatio then
+            flags[#flags + 1] = string.format("SLIP:%.2f", slipRatio)
+        else
+            flags[#flags + 1] = "SLIP"
+        end
+    end
     local clock = os.date("%H:%M:%S")
     local line7 = table.concat(flags, " ")
     if monH < 9 then
@@ -1377,6 +1492,11 @@ while true do
     end
 
     local actualSpeed = getActualSpeed() or 0
+
+    -- Wheel slip guard: cap the traction if the wheels are spinning instead
+    -- of pushing. Runs here (not with the overstress guard at the top of the
+    -- loop) because it needs this tick's speed reading.
+    updateSlipGuard(dt, actualSpeed)
 
     -- Calibration trigger: armed at EB, pull the RHI handle to N (signal 10)
     -- to start. Full pre-checks run here with current loop state; on refusal
