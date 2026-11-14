@@ -90,6 +90,12 @@ return {
     calibRunTimeout     = 120.0,   -- 爬升阶段兜底超时 (s)
     calibBrakeTimeout   = 60.0,    -- 制动段超时下限 (s)，实际按最高速度放大
     calibSettle         = 0.5,     -- 输出切换后的稳定时间 (s)
+
+    -- 驾驶台遥显（可选）：displayMode = true 的电脑只画面板，不驱动
+    displayMode     = false,       -- true = 本机是只读显示器终端
+    displayProtocol = nil,         -- nil = "<mu 协议>-disp"
+    displayInterval = 0.25,        -- s：主机快照周期；false = 不发布
+    displayStale    = 2.0,         -- s：超过这么久没快照 → STALE / LINK LOST
 }
 ```
 
@@ -228,6 +234,45 @@ return {
 
 ---
 
+## 六·五、驾驶台遥显（displayMode）
+
+**用途**：驾驶室空间小，塞不下第二套传感器/转向架外设，但又想让司机在驾驶台看仪表。给驾驶台一台**只读**电脑即可：它只接收主机广播的快照并绘制面板，**不驱动任何东西**。
+
+**硬件**：电脑 + 显示器（`sideMonitor` 那面）+ 无线 modem（`sideModem` 那面）。**不需要**转向架、速度传感器、应力表、手柄、模式拉杆。
+
+**配置**（驾驶台那台的 `config_locomodel.lua`）：
+
+| 键 | 值 | 说明 |
+| --- | --- | --- |
+| `displayMode` | `true` | 本机只当显示器终端，进入显示循环后不再控车 |
+| `displayProtocol` | `nil`（默认） | 默认 `"<mu 协议>-disp"`；手填则**两端必须一致** |
+| `displayInterval` | `0.25` | 主机快照周期（s）；`false` = 主机不发布（省无线流量） |
+| `displayStale` | `2.0` | 超过这么久没收到快照就显示 `LINK LOST` |
+
+驾驶台那台**仍然要拷 `mu_config.lua`**：它只用来取 `protocol` 推出显示频道名，别的字段不读。
+
+**协议与安全**：
+
+- 显示数据走**独立协议** `<mu 协议>-disp`，与控制协议 `loco-mu` 完全分开：
+  - 终端**永远不会**被算成主机（`masters` 计数只看控制协议），所以放几台都不影响"恰好一台主机"的安全检查；
+  - 显示流量**不进入**控制环：控车电脑收到该协议的消息直接丢弃，不解析、不改变任何超时。
+- 只有**主机**发布快照（从机没有设定速度/红灯距离，发出来也没用）。快照含：设定速度、实际速度、驱动应力、制动强度、方向、档位、故障、红灯距离、目视/锁存/待命/空转状态、以及一份编组清单（label + 角色）。
+- 发送端用 `displayInterval` 限流，默认 4 Hz，与车上显示器刷新率一致。
+
+**显示内容**：与车上显示器**同一份绘制代码**（`drawDisplay`），所以布局、颜色、故障横幅永远不会两边不一致。标题是 `<主机 label>  CAB`。
+
+**失效语义**（有意做成"看得见"）：
+
+| 情况 | 面板 |
+| --- | --- |
+| 快照年龄 > 1 s | 第 7 行红字 `STALE x.xs`（其余字段仍是上次的值） |
+| 超过 `displayStale` 没快照（主机死机/出网络范围/全列无主机） | 红字 `LINK LOST`，速度等字段显示 `--` / `N/A` |
+| 组内主机数 ≠ 1 | 第 8 行 `** FAULT EB **`（主机广播的 `fault` 字段） |
+
+**注意**：终端自己不解锁任何操作——它没有键盘命令，也不接受控制输入。想控车必须把手柄/拉杆接到**主机**那台（两者都是模拟红石量，驾驶台到主机之间可以用 Create 红石链接无线传递，脚本侧无需改动）。
+
+---
+
 ## 七、常见问题速查
 
 | 症状 | 原因 | 处理 |
@@ -239,6 +284,8 @@ return {
 | 显示器 `T:` 有数值、车却不动或一顿一顿 | 动力网络 overstressed：`getSpeed()` 被清零，牵引力整体为 0 | 接 `Create_Stressometer` 看 `used/capacity`；控制台出现 `STRESS GUARD:` 就是保护在介入，调小 `bogeyDriveMax` 或加大动力产能（多并电机/提高转速） |
 | 显示器 `T:` 无变化 | 驱动应力未变或外设失联 | 控制台 `BOGEY CALL FAILED` 提示；`bogey_probe.lua` 单测 |
 | 倒车被红灯挡住 | 探针轴固定在转向架一端，倒车时朝车尾 | 拉杆 11-15 时保护整体豁免（靠目视）；倒车也要保护得改成按行驶方向选轴 |
+| 驾驶台显示 `LINK LOST` | 主机没发布快照：主机死机 / 无线出范围 / 全列没有主机 / `displayInterval = false` | 看主机控制台有无 `Display terminal started`；核对两台 `mu_config.protocol` 一致；确认有一台在主机位 |
+| 驾驶台显示 `STALE` | 快照变老（主机短暂停顿或链路抖动） | 偶发一两次是链路抖动，持续出现按上一行排查 |
 | 前进时保护方向反了（对后方红灯制动 / 前方红灯不动作） | `redProbeFront` 与实际行驶方向相反（纹理方向标识容易看反） | 取反 `redProbeFront`；用 `bogey_probe.lua` 对比两轴 `trackDir` 与行驶方向 |
 | 显示器一直不显示 `R:`（红灯不生效） | 探针距离为 0（模组默认）或信号朝向相反 | 看启动横幅 `Red protection: probe front axle, window ...`；`bogey_probe.lua` 查 `getProbeDistance` 与 `occupiedSignalAligned` |
 | 红灯不触发 EB / 触发太早 | `redEbDistance` 不合适或探针轴不对 | 调 `redEbDistance`（默认 4 格）；用 `bogey_probe.lua` 核对轴与距离 |

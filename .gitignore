@@ -45,3 +45,7 @@ desktop.ini
 # ---- Node 依赖（tcc/ 是零依赖的，这里只是防止误装到仓库根） ----
 node_modules/
 package-lock.json
+
+# ---- Python test harness cache ----
+__pycache__/
+*.pyc

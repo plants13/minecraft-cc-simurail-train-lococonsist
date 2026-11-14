@@ -172,4 +172,19 @@ return {
     slipGuardRelease   = 10.0,   -- ceiling recovery rate (units/s, 0..128 scale)
     slipGuardHold      = 0.4,    -- s: no ceiling movement right after a cut
     slipGuardFilter    = 0.30,   -- s: acceleration smoothing window (sensor noise)
+
+    -- ---- Display terminal (cab monitor, optional) ----
+    -- A computer that draws the driving display WITHOUT driving anything: no
+    -- bogey, no velocity sensor, just a monitor and a wireless modem. It
+    -- listens on its own protocol (the control protocol is untouched), so it
+    -- cannot be counted as a master and its traffic never reaches the control
+    -- loop. The master publishes a snapshot every displayInterval seconds.
+    --   displayMode = true  -> this computer IS the terminal (draws only)
+    --   displayMode = false -> this computer drives and publishes snapshots
+    -- A terminal is a separate protocol listener, so the loco may run without
+    -- one and a terminal may run with the loco off (it then shows LINK LOST).
+    displayMode     = false,   -- true = read-only display terminal, not a loco
+    displayProtocol = nil,     -- nil = "<mu protocol>-disp" (per-consist isolation)
+    displayInterval = 0.25,    -- s: master snapshot period; false = do not publish
+    displayStale    = 2.0,     -- s: no snapshot for this long -> STALE/LINK LOST
 }
