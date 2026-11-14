@@ -9,6 +9,11 @@
 -- Network safety: exactly ONE vehicle may be in master mode. If zero or
 -- more than one master is detected on the consist protocol, every vehicle
 -- cuts traction and applies emergency brake (EB).
+--
+-- A third, non-driving role exists on a SEPARATE protocol: with
+-- cfg.displayMode = true this computer becomes a read-only cab display
+-- terminal (monitor + modem only). It never publishes on the control
+-- protocol, so it cannot count as a master. See section 8b.
 
 -- ============================================================
 -- 0. Load config
@@ -62,7 +67,7 @@ for _, name in ipairs(peripheral.getNames()) do
 end
 if #bogeys > 0 then
     print("Bogey peripherals found: " .. #bogeys)
-else
+elseif not cfg.displayMode then
     print("ERROR: no Simurail_PhysicsBogey peripheral - this vehicle cannot drive or brake")
     print("       (check the wired network / that the bogey block is loaded)")
 end
@@ -86,7 +91,7 @@ for _, name in ipairs(peripheral.getNames()) do
 end
 if #stressGauges > 0 then
     print("Stress gauge found: " .. #stressGauges .. " - overstress guard ACTIVE")
-else
+elseif not cfg.displayMode then
     print("No Create_Stressometer peripheral - overstress guard disabled")
 end
 
@@ -316,6 +321,19 @@ end
 local MU_PROTOCOL = mu.protocol or "loco-mu"
 local MU_TTL      = 2.5   -- s: a sender's status expires after this long
 local MU_CTRL_TTL = 1.5   -- s: slave applies EB if no fresh master control
+
+-- Display terminal channel. Deliberately NOT the control protocol: the
+-- terminal must never be counted as a master, and display traffic must not
+-- add parsing or timeouts to the driving loop. Derived from the consist
+-- protocol so two consists on the same wireless band stay isolated.
+local MU_DISP_PROTOCOL = cfg.displayProtocol or (MU_PROTOCOL .. "-disp")
+local DISP_INTERVAL = 0.25   -- s: master snapshot period (nil = do not publish)
+if cfg.displayInterval == false then
+    DISP_INTERVAL = nil
+elseif type(cfg.displayInterval) == "number" and cfg.displayInterval > 0 then
+    DISP_INTERVAL = math.max(0.05, cfg.displayInterval)
+end
+local DISP_STALE = tonumber(cfg.displayStale or 2.0) or 2.0
 
 local locoName = os.getComputerLabel() or ("CC#" .. os.getComputerID())
 local selfID   = os.getComputerID()
@@ -797,7 +815,7 @@ for _, name in ipairs(peripheral.getNames()) do
         break
     end
 end
-if not sensor then
+if not sensor and not cfg.displayMode then
     print("WARNING: No velocity_sensor found. Actual speed will show N/A.")
 end
 
@@ -834,106 +852,162 @@ if monitor then
     end
 end
 
--- Speed color: green=slow, yellow=mid, red=fast, gray=stopped
-local function speedColor(v)
+-- Speed color: green=slow, yellow=mid, red=fast, gray=stopped. `maxV` lets a
+-- remote display terminal use the publishing loco's ceiling instead of its own.
+local function speedColor(v, maxV)
+    maxV = maxV or MAX_SPEED
     if v <= 0 then
         return colors.lightGray
-    elseif v < MAX_SPEED * 0.4 then
+    elseif v < maxV * 0.4 then
         return colors.green
-    elseif v < MAX_SPEED * 0.8 then
+    elseif v < maxV * 0.8 then
         return colors.yellow
     else
         return colors.red
     end
 end
 
--- updateDisplay(setSpeed, actualSpeed, driveOut, brakeOut, reverse, level, role, fault, redDist)
-local function updateDisplay(setSpeed, actualSpeed, driveOut, brakeOut, reverse, level, role, fault, redDist)
-    if not monitor then return end
-    mCall("clear")
+-- Draw one screen of the driving display. `call` is a guarded write sink
+-- (mCall for the local monitor, a wrapper for a remote terminal's monitor),
+-- so the loco monitor and a cab display terminal render from the SAME code:
+-- the driver can never see a layout the terminal does not have.
+--
+-- d = { setSpeed, speed, throttle, brake, reverse, level, role, fault,
+--       redDist, visual, latch, armed, slip, slipRatio, maxSpeed, warn }
+--   setSpeed/speed are m/s, throttle is unsigned stress (0..DRIVE_STRESS_MAX),
+--   brake is 0..1, warn replaces line 7 with a red banner (STALE / LINK LOST).
+local function drawDisplay(call, title, height, d)
+    if not call then return end
+    d = d or {}
+    local maxV = d.maxSpeed or MAX_SPEED
+    local brake = d.brake or 0
+    call("clear")
 
-    -- Line 1: Locomotive name
-    mCall("setCursorPos", 1, 1)
-    mCall("setTextColor", colors.yellow)
-    monitor.write(locoName)
+    -- Line 1: source name (loco label, or the publishing label + CAB)
+    call("setCursorPos", 1, 1)
+    call("setTextColor", colors.yellow)
+    call("write", title)
 
-    -- Line 2: Set speed (km/h)
-    mCall("setCursorPos", 1, 2)
-    mCall("setTextColor", speedColor(setSpeed))
-    monitor.write(string.format("Set:%.1f", setSpeed * 3.6))
-
-    -- Line 3: Actual speed from sensor, km/h (0 if sensor unavailable)
-    mCall("setCursorPos", 1, 3)
-    mCall("setTextColor", speedColor(actualSpeed))
-    monitor.write(string.format("Spd:%.1f ", actualSpeed * 3.6))
-
-    -- Line 4: Drive stress output (0..128, sign = direction)
-    mCall("setCursorPos", 1, 4)
-    mCall("setTextColor", colors.cyan)
-    local stressOut = math.floor(driveOut + 0.5)
-    if reverse then stressOut = -stressOut end
-    monitor.write(string.format("T:%+4d", stressOut))
-
-    -- Line 5: Brake strength percent (0-100, bogey brakeStrength is 0..1)
-    mCall("setCursorPos", 1, 5)
-    if brakeOut > 0 then
-        mCall("setTextColor", colors.red)
+    -- Line 2: set speed (km/h)
+    call("setCursorPos", 1, 2)
+    if d.setSpeed then
+        call("setTextColor", speedColor(d.setSpeed, maxV))
+        call("write", string.format("Set:%.1f", d.setSpeed * 3.6))
     else
-        mCall("setTextColor", colors.gray)
-    end
-    monitor.write(string.format("B:%3d%%", math.floor(brakeOut * 100 + 0.5)))
-
-    -- Line 6: Direction
-    mCall("setCursorPos", 1, 6)
-    if reverse then
-        mCall("setTextColor", colors.orange)
-        monitor.write("DIR: << REV")
-    else
-        mCall("setTextColor", colors.lime)
-        monitor.write("DIR:  FWD >>")
+        call("setTextColor", colors.gray)
+        call("write", "Set:  --")
     end
 
-    -- Line 7: status flags (BRK / red distance / VIS / LAT / ARM)
+    -- Line 3: actual speed from the sensor, km/h (N/A when there is none)
+    call("setCursorPos", 1, 3)
+    if d.speed then
+        call("setTextColor", speedColor(d.speed, maxV))
+        call("write", string.format("Spd:%.1f ", d.speed * 3.6))
+    else
+        call("setTextColor", colors.gray)
+        call("write", "Spd: N/A ")
+    end
+
+    -- Line 4: drive stress output (0..DRIVE_STRESS_MAX, sign = direction).
+    -- nil throttle = unknown (no snapshot yet), shown as -- not as 0.
+    call("setCursorPos", 1, 4)
+    call("setTextColor", colors.cyan)
+    if d.throttle == nil then
+        call("write", "T:  --")
+    else
+        local stressOut = math.floor(d.throttle + 0.5)
+        if d.reverse then stressOut = -stressOut end
+        call("write", string.format("T:%+4d", stressOut))
+    end
+
+    -- Line 5: brake strength percent (bogey brakeStrength is 0..1)
+    call("setCursorPos", 1, 5)
+    if d.brake == nil then
+        call("setTextColor", colors.gray)
+        call("write", "B:  --")
+    elseif d.brake > 0 then
+        call("setTextColor", colors.red)
+        call("write", string.format("B:%3d%%", math.floor(d.brake * 100 + 0.5)))
+    else
+        call("setTextColor", colors.gray)
+        call("write", string.format("B:%3d%%", math.floor(d.brake * 100 + 0.5)))
+    end
+
+    -- Line 6: direction
+    call("setCursorPos", 1, 6)
+    if d.reverse == nil then
+        call("setTextColor", colors.gray)
+        call("write", "DIR:   --")
+    elseif d.reverse then
+        call("setTextColor", colors.orange)
+        call("write", "DIR: << REV")
+    else
+        call("setTextColor", colors.lime)
+        call("write", "DIR:  FWD >>")
+    end
+
+    -- Line 7: status flags (BRK / red distance / VIS / LAT / ARM / SLIP), or a
+    -- warning banner when there is one - that matters more than the flags
     local flags = {}
-    if brakeOut > 0 then flags[#flags + 1] = "BRK" end
-    if redDist then flags[#flags + 1] = string.format("R:%.0f", redDist) end
-    if visualDriving then flags[#flags + 1] = "VIS" end
-    if redLatch then flags[#flags + 1] = "LAT" end
-    if calibArmed then flags[#flags + 1] = "ARM" end
-    if slipActive then
+    if brake > 0 then flags[#flags + 1] = "BRK" end
+    if d.redDist then flags[#flags + 1] = string.format("R:%.0f", d.redDist) end
+    if d.visual then flags[#flags + 1] = "VIS" end
+    if d.latch then flags[#flags + 1] = "LAT" end
+    if d.armed then flags[#flags + 1] = "ARM" end
+    if d.slip then
         -- ratio shown as well: it is the number you tune slipGuardRatio against
-        if slipRatio then
-            flags[#flags + 1] = string.format("SLIP:%.2f", slipRatio)
+        if d.slipRatio then
+            flags[#flags + 1] = string.format("SLIP:%.2f", d.slipRatio)
         else
             flags[#flags + 1] = "SLIP"
         end
     end
     local clock = os.date("%H:%M:%S")
     local line7 = table.concat(flags, " ")
-    if monH < 9 then
+    if height < 9 then
         -- Short monitor: no room for the clock line, keep it on line 7.
         line7 = (line7 ~= "") and (clock .. " " .. line7) or clock
     end
-    mCall("setCursorPos", 1, 7)
-    mCall("setTextColor", colors.lightGray)
-    monitor.write(line7)
-
-    -- Line 8: Role + notch level, or network fault
-    mCall("setCursorPos", 1, 8)
-    if fault then
-        mCall("setTextColor", colors.red)
-        monitor.write("** FAULT EB **")
+    call("setCursorPos", 1, 7)
+    if d.warn then
+        call("setTextColor", colors.red)
+        call("write", d.warn)
     else
-        mCall("setTextColor", colors.white)
-        monitor.write((role == "master" and "M:" or "S:") .. (level or "?"))
+        call("setTextColor", colors.lightGray)
+        call("write", line7)
+    end
+
+    -- Line 8: role + notch level, or network fault, or no data at all
+    call("setCursorPos", 1, 8)
+    if d.fault then
+        call("setTextColor", colors.red)
+        call("write", "** FAULT EB **")
+    elseif d.role then
+        call("setTextColor", colors.white)
+        call("write", (d.role == "master" and "M:" or "S:") .. (d.level or "?"))
+    else
+        call("setTextColor", colors.gray)
+        call("write", "-- no data --")
     end
 
     -- Line 9: clock, under the notch level
-    if monH >= 9 then
-        mCall("setCursorPos", 1, 9)
-        mCall("setTextColor", colors.lightGray)
-        monitor.write(clock)
+    if height >= 9 then
+        call("setCursorPos", 1, 9)
+        call("setTextColor", colors.lightGray)
+        call("write", clock)
     end
+end
+
+-- Local monitor draw: same layout, values straight from the driving loop.
+local function updateDisplay(setSpeed, actualSpeed, driveOut, brakeOut, reverse, level, role, fault, redDist)
+    if not monitor then return end
+    drawDisplay(mCall, locoName, monH, {
+        setSpeed = setSpeed, speed = actualSpeed,
+        throttle = driveOut, brake = brakeOut, reverse = reverse,
+        level = level, role = role, fault = fault, redDist = redDist,
+        visual = visualDriving, latch = redLatch, armed = calibArmed,
+        slip = slipActive, slipRatio = slipRatio, maxSpeed = MAX_SPEED,
+    })
 end
 
 -- ============================================================
@@ -972,6 +1046,29 @@ local function broadcastState(role, ctrl)
         print("BROADCAST FAILED: " .. tostring(err) .. " (reported once)")
     end
     txCount = txCount + 1
+end
+
+-- Display snapshot (master only): everything the display layout needs, on its
+-- own protocol. Gated by DISP_INTERVAL; nil disables publishing entirely.
+-- The consist list is labels + roles only - per-car telemetry would be N times
+-- the traffic for information the driver does not act on.
+local lastDisplayTx = 0
+
+local function broadcastDisplay(d)
+    if not netUp or not DISP_INTERVAL then return end
+    local dNow = os.clock()
+    if dNow - lastDisplayTx < DISP_INTERVAL then return end
+    lastDisplayTx = dNow
+    d.label = locoName
+    d.id = selfID
+    d.maxSpeed = MAX_SPEED
+    d.protocol = MU_PROTOCOL
+    local cars = {}
+    for _, s in pairs(seen) do
+        cars[#cars + 1] = { label = s.label, role = s.mode }
+    end
+    d.cars = cars
+    pcall(rednet.broadcast, d, MU_DISP_PROTOCOL)
 end
 
 -- ============================================================
@@ -1371,8 +1468,104 @@ local function startCalibration(role, fault, redDist, actualSpeed)
 end
 
 -- ============================================================
+-- 7e. Display terminal (optional, read-only cab monitor)
+-- ============================================================
+-- A cab computer with a monitor and a modem and NO driving hardware. It
+-- listens on MU_DISP_PROTOCOL only: it never publishes on the control
+-- protocol, so the "exactly one master" check cannot see it, and the driving
+-- loop is unchanged (display messages are dropped silently there).
+-- The loco monitor and this terminal share drawDisplay, so the two screens
+-- always show the same layout.
+--
+-- Failure behaviour is deliberately visible: a snapshot older than
+-- displayStale seconds is drawn as LINK LOST instead of plausible numbers. A
+-- display that quietly freezes is worse than no display at all.
+local function runDisplayTerminal()
+    if not monitor then
+        print("DISPLAY MODE: no monitor on side '" .. tostring(SIDE_MONITOR) .. "'")
+        print("              this computer only draws, so there is nothing to do")
+        return
+    end
+    if not netUp then
+        print("DISPLAY MODE: no modem on side '" .. tostring(SIDE_MODEM) .. "', cannot receive")
+        return
+    end
+    local function dCall(method, ...)
+        if monitor[method] then pcall(monitor[method], ...) end
+    end
+    dCall("setTextScale", 0.5)
+    dCall("setBackgroundColor", colors.black)
+    dCall("clear")
+    print("Display terminal started: protocol '" .. MU_DISP_PROTOCOL .. "'")
+    print("Waiting for a master snapshot - drop displayMode = true to drive instead")
+
+    local snaps = {}        -- [label] = { d = snapshot, t = os.clock() }
+    local lastDraw = 0
+    local lostWarned = false
+    os.startTimer(0.25)
+    while true do
+        local ev, p1, p2, p3 = os.pullEvent()
+        if ev == "terminate" then
+            error("Terminated", 0)
+        elseif ev == "rednet_message" then
+            if p3 == MU_DISP_PROTOCOL and type(p2) == "table" then
+                snaps[p2.label or ("#" .. tostring(p1))] = { d = p2, t = os.clock() }
+            end
+        elseif ev == "timer" then
+            os.startTimer(0.25)
+            local now = os.clock()
+            if now - lastDraw >= 0.20 then
+                lastDraw = now
+                -- Prefer the master's snapshot, else the freshest one: a
+                -- consist with no master is exactly what the driver must see.
+                local pick, pickT, master = nil, -1, nil
+                for _, s in pairs(snaps) do
+                    if now - s.t <= DISP_STALE then
+                        if s.d.role == "master" and (not master or s.t > master.t) then
+                            master = s
+                        end
+                        if s.t > pickT then
+                            pick, pickT = s, s.t
+                        end
+                    end
+                end
+                if master then pick = master end
+                if pick then
+                    lostWarned = false
+                    local d = pick.d
+                    local age = now - pick.t
+                    drawDisplay(dCall, (d.label or "?") .. "  CAB", monH, {
+                        setSpeed = d.setSpeed, speed = d.speed,
+                        throttle = d.throttle, brake = d.brake,
+                        reverse = d.reverse, level = d.level, role = d.role,
+                        fault = d.fault, redDist = d.redDist, visual = d.visual,
+                        latch = d.latch, armed = d.armed, slip = d.slip,
+                        slipRatio = d.slipRatio, maxSpeed = d.maxSpeed,
+                        warn = (age > 1.0) and string.format("STALE %.1fs", age) or nil,
+                    })
+                else
+                    if not lostWarned then
+                        lostWarned = true
+                        print(string.format(
+                            "DISPLAY MODE: no snapshot for %.1fs on '%s' - showing LINK LOST",
+                            DISP_STALE, MU_DISP_PROTOCOL))
+                    end
+                    drawDisplay(dCall, locoName .. "  CAB", monH, { warn = "LINK LOST" })
+                end
+            end
+        end
+    end
+end
+
+-- ============================================================
 -- 8. Main loop
 -- ============================================================
+-- Display terminal: draw the cab screen and nothing else. Handled before
+-- anything touches the outputs, so a terminal computer never tries to drive.
+if cfg.displayMode then
+    runDisplayTerminal()
+end
+
 print("Locomotive program started: " .. locoName)
 print("Max speed: " .. MAX_SPEED .. " m/s | Ctrl+T to stop")
 print("Commands: VisualDriving (vd) | Calibrate (calib) | help")
@@ -1433,7 +1626,11 @@ while true do
     -- modem events and break reception) and it is used even without a modem
     -- so terminal commands (VisualDriving / Calibrate) still work.
     local sender, msg, proto = receiveWithInput(PID_DT)
-    if sender and proto ~= MU_PROTOCOL then
+    if sender and proto == MU_DISP_PROTOCOL then
+        -- Display snapshots are for the cab terminal, not for the driving
+        -- loop: drop them silently (no foreign-protocol warning).
+        msg = nil
+    elseif sender and proto ~= MU_PROTOCOL then
         if not foreignWarned then
             foreignWarned = true
             print("Foreign protocol '" .. tostring(proto) .. "' ignored (ours '" .. MU_PROTOCOL .. "')")
@@ -1639,6 +1836,15 @@ while true do
         broadcastState(role, {
             throttle = driveOut, brake = brakeOut, reverse = revOut,
             level = level, setSpeed = setSpeed,
+        })
+        -- Same values to the cab terminal, on the display protocol (rate
+        -- limited inside broadcastDisplay; a no-op without a modem).
+        broadcastDisplay({
+            role = role, setSpeed = setSpeed, speed = actualSpeed,
+            throttle = driveOut, brake = brakeOut, reverse = revOut,
+            level = level, fault = fault, redDist = redDist,
+            visual = visualDriving, latch = redLatch, armed = calibArmed,
+            slip = slipActive, slipRatio = slipRatio,
         })
     else
         -- Slave: replicate last master control, flip direction per consist config
