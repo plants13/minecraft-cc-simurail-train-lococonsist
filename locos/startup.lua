@@ -335,6 +335,94 @@ elseif type(cfg.displayInterval) == "number" and cfg.displayInterval > 0 then
 end
 local DISP_STALE = tonumber(cfg.displayStale or 2.0) or 2.0
 
+-- Manual desk channel (optional). A cab terminal with a Simulated
+-- linked_typewriter acts as a desk: the typewriter reports raw key presses,
+-- the terminal forwards notch + steer to the controlling loco. Its own
+-- protocol again, so the driving loop's message handling is unaffected.
+-- The loco is the authority for safety: it applies the link timeout and the
+-- vigilance (deadman) timer locally, so a radio failure can never leave the
+-- train running unattended.
+local MANUAL = {
+    protocol = cfg.manualProtocol or (MU_PROTOCOL .. "-manual"),
+    -- A dropped packet means the notch reading is missing, not that the driver
+    -- wants to stop. 2.5 s survives a chunk-load stall or a TPS hiccup without
+    -- tripping (a genuinely gone desk still brakes within 2.5 s).
+    ttl      = tonumber(cfg.manualTimeout or 2.5) or 2.5,
+    vig      = cfg.vigilanceEnabled == true,
+    -- true: a lost desk brakes but KEEPS the set speed, so the target survives
+    -- a radio hiccup instead of being silently zeroed.
+    hold     = cfg.manualHoldSpeedOnLoss ~= false,
+    period   = tonumber(cfg.vigilancePeriod or 30.0) or 30.0, -- s: a press is due
+    grace    = tonumber(cfg.vigilanceGrace or 15.0) or 15.0,  -- s: warning window
+    brake    = math.max(0, math.min(1, tonumber(cfg.vigilanceBrake or 0.5) or 0.5)),
+    blink    = 0.5,                                         -- s: warning blink
+    file     = "manual.json",   -- persisted mode, written by the console command
+    -- "the set speed collapsed again" diagnostics: last effective set speed
+    -- and the branch tag that zeroed it (fields, not locals - see below)
+    lastSpd    = 0,
+    zeroReason = nil,
+}
+
+-- Persisted manual mode. `Manual` is a MODE, not a one-off toggle: after a
+-- reboot the loco must come back in the state the driver last chose, instead
+-- of silently handing control back to a physical handle that may be sitting in
+-- a drive notch. Precedence: state file (written by the command) > the
+-- manualDefault config value.
+MANUAL.readState = function()
+    if not fs.exists(MANUAL.file) then return nil end
+    local ok, data = pcall(function()
+        local f = fs.open(MANUAL.file, "r")
+        local text = f.readAll()
+        f.close()
+        return textutils.unserializeJSON(text)
+    end)
+    if ok and type(data) == "table" and type(data.manual) == "boolean" then
+        return data.manual
+    end
+    return nil   -- missing/corrupt: fall back to the config default
+end
+
+MANUAL.writeState = function(on)
+    local ok, err = pcall(function()
+        local f = fs.open(MANUAL.file, "w")
+        if not f then error("cannot open " .. MANUAL.file .. " for writing") end
+        f.write(textutils.serializeJSON({ manual = on }))
+        f.close()
+    end)
+    if not ok then
+        print("MANUAL: cannot persist mode to " .. MANUAL.file .. " - " .. tostring(err))
+    end
+end
+
+-- Manual desk state (written by the receive path, read by the main loop).
+-- Kept in ONE table: the main chunk is right at Lua 5.1's 200-local limit.
+local desk = {
+    active   = false,  -- "Manual" typed at this loco: the desk drives
+    notch    = 10,     -- same 0..15 mapping as the lever (10 = N)
+    steer    = 0,      -- desk request: -1 left, 0 straight, +1 right
+    rx       = 0,      -- os.clock() of the last desk packet
+    ack      = nil,    -- last vigilance ack counter seen from the desk
+    lostWarned = false,
+    applied  = 0,      -- steer currently written to the bogeys
+    -- nil while automatic, else the notch updateRHI() must use instead of the
+    -- lever; the whole notch/EB/K-ramp machinery is reused verbatim.
+    override = nil,
+    vigLast    = 0,    -- os.clock() of the last SPACE acknowledgement
+    vigTripped = false,
+    vigWarn    = false,
+    vigPrevWarn = false,
+}
+
+-- Boot state: what the console command last wrote, else the configured
+-- default. A restored manual mode starts in EB until the desk talks (see the
+-- manual branch of the loop), which is strictly safer than falling back to a
+-- physical handle nobody is holding.
+desk.active = MANUAL.readState()
+desk.fromFile = desk.active ~= nil
+if desk.active == nil then
+    desk.active = cfg.manualDefault == true
+end
+
 local locoName = os.getComputerLabel() or ("CC#" .. os.getComputerID())
 local selfID   = os.getComputerID()
 local visualDriving = false   -- runtime "VisualDriving" command state
@@ -618,7 +706,13 @@ end
 -- notch signal. actualSpeed (m/s) is used to hand the set speed over when the
 -- handle comes back into the N/K region.
 local function updateRHI(dt, actualSpeed)
-    local sig = redstone.getAnalogInput(SIDE_SETSPEED)
+    -- desk.override is set while a cab desk is driving: the notch then
+    -- comes from the typewriter instead of the lever, and every downstream
+    -- notch rule (B / N / C / K1..K4, EB) is reused unchanged.
+    local sig = desk.override
+    if sig == nil then
+        sig = redstone.getAnalogInput(SIDE_SETSPEED) or 0
+    end
 
     -- Entering the speed-control region (N / K1..K4) from EB, a B notch or C
     -- starts the set speed at the CURRENT speed: the train then holds or ramps
@@ -962,6 +1056,12 @@ local function drawDisplay(call, title, height, d)
             flags[#flags + 1] = "SLIP"
         end
     end
+    -- Manual desk: MAN while the desk drives, VIG? / VIG! for the vigilance
+    if d.manual then flags[#flags + 1] = "MAN" end
+    if d.vigTrip then flags[#flags + 1] = "VIG!"
+    elseif d.vigWarn then flags[#flags + 1] = "VIG?" end
+    if d.desk then flags[#flags + 1] = d.desk end
+    if d.deskPending then flags[#flags + 1] = "DSK" end
     local clock = os.date("%H:%M:%S")
     local line7 = table.concat(flags, " ")
     if height < 9 then
@@ -971,7 +1071,13 @@ local function drawDisplay(call, title, height, d)
     call("setCursorPos", 1, 7)
     if d.warn then
         call("setTextColor", colors.red)
-        call("write", d.warn)
+        -- the desk tag is the one thing a driver must still see while the
+        -- link is down: it tells him what the desk is asking for
+        if d.desk then
+            call("write", d.warn .. " " .. d.desk)
+        else
+            call("write", d.warn)
+        end
     else
         call("setTextColor", colors.lightGray)
         call("write", line7)
@@ -1018,6 +1124,23 @@ if not netUp then
     print("WARNING: no modem on side '" .. SIDE_MODEM .. "', consist network disabled")
 else
     print("Network up on protocol '" .. MU_PROTOCOL .. "'")
+end
+-- A restored manual mode without a modem can never receive a desk packet: the
+-- loop would sit in EB forever with no way out except typing the command, so
+-- drop to handle control (the state file keeps the driver's wish for later).
+if desk.active then
+    if netUp then
+        if desk.fromFile then
+            print("MANUAL: mode restored from " .. MANUAL.file ..
+                " - EB until a desk packet arrives (type Manual to go back to the handle)")
+        else
+            print("MANUAL: manualDefault = true - EB until a desk packet arrives " ..
+                "(type Manual to go back to the handle)")
+        end
+    else
+        desk.active = false
+        print("MANUAL: restored mode ignored - no modem on '" .. tostring(SIDE_MODEM) .. "'")
+    end
 end
 
 -- seen[senderID] = { mode = "master"/"slave", label = ..., t = os.clock() }
@@ -1079,6 +1202,20 @@ end
 --                           red signals allowed). Type help for the list.
 local cmdBuffer = ""
 
+-- Steer override for the whole vehicle. The setter is a mainThread peripheral
+-- call, so it is only issued when the value actually changes.
+local function applySteer(want)
+    if want == desk.applied then return end
+    desk.applied = want
+    for _, p in ipairs(bogeys) do
+        if want == 0 then
+            pcall(p.disableSteerValueOverride)
+        else
+            pcall(p.setSteerValueOverride, want)
+        end
+    end
+end
+
 local function submitCommand()
     local cmd = string.lower(cmdBuffer)
     cmdBuffer = ""
@@ -1090,7 +1227,36 @@ local function submitCommand()
             print("Visual driving OFF")
         end
     elseif cmd == "help" then
-        print("Commands: VisualDriving (vd), Calibrate (calib), help")
+        print("Commands: VisualDriving (vd), Calibrate (calib), Manual (man), help")
+    elseif cmd == "manual" or cmd == "man" then
+        -- Manual mode is entered HERE, at the loco: a desk broadcasting on the
+        -- manual protocol can never take over on its own.
+        if not netUp then
+            print("MANUAL: no modem on '" .. tostring(SIDE_MODEM) .. "', a desk cannot reach this loco")
+        elseif desk.active then
+            desk.active = false
+            desk.override = nil
+            desk.vigTripped = false
+            desk.vigWarn = false
+            applySteer(0)
+            MANUAL.writeState(false)
+            print("MANUAL: off - the RHI handle controls this loco again")
+        else
+            desk.active = true
+            desk.notch = 10
+            desk.rx = 0
+            desk.ack = nil
+            desk.vigLast = os.clock()
+            desk.vigTripped = false
+            desk.vigWarn = false
+            MANUAL.writeState(true)
+            print("MANUAL: on - waiting for a desk on '" .. MANUAL.protocol .. "'")
+            print("        W/S notch, A/D steer, SHIFT = EB, SPACE = vigilance")
+            if MANUAL.vig then
+                print(string.format("        vigilance ON: SPACE every %.0fs (%.0fs warning)",
+                    MANUAL.period, MANUAL.grace))
+            end
+        end
     elseif cmd == "calibrate" or cmd == "calib" then
         if calib then
             print("CALIB: already running (step " .. calib.step .. ")")
@@ -1499,6 +1665,30 @@ local function runDisplayTerminal()
     print("Display terminal started: protocol '" .. MU_DISP_PROTOCOL .. "'")
     print("Waiting for a master snapshot - drop displayMode = true to drive instead")
 
+    -- Optional driving desk: a Simulated linked_typewriter next to this
+    -- computer reports raw key presses (only keys BOUND in its own GUI are
+    -- reported at all). The terminal turns them into a notch and a steer
+    -- request and forwards both to the loco, which owns the safety timers.
+    -- Note the typewriter and the computer's own terminal are mutually
+    -- exclusive: opening any screen disconnects the typewriter client-side.
+    local tw = nil
+    for _, name in ipairs(peripheral.getNames()) do
+        if peripheral.getType(name) == "linked_typewriter" then
+            tw = name
+            break
+        end
+    end
+    local deskNotch, deskSteer = 10, 0   -- 10 = N, same mapping as the lever
+    local heldLeft, heldRight = false, false
+    local deskAck = 0
+    local lastManualTx = 0
+    if tw then
+        print("Desk: linked_typewriter on '" .. tw .. "' (protocol '" .. MANUAL.protocol .. "')")
+        print("      W/S notch, A/D steer, LEFT SHIFT = EB, SPACE = vigilance")
+    else
+        print("Desk: no linked_typewriter peripheral - display only")
+    end
+
     local snaps = {}        -- [label] = { d = snapshot, t = os.clock() }
     local lastDraw = 0
     local lostWarned = false
@@ -1511,9 +1701,51 @@ local function runDisplayTerminal()
             if p3 == MU_DISP_PROTOCOL and type(p2) == "table" then
                 snaps[p2.label or ("#" .. tostring(p1))] = { d = p2, t = os.clock() }
             end
+        elseif ev == "key" and tw then
+            -- Typewriter report. A bound key produces exactly one of these per
+            -- press (GLFW repeats are filtered by the mod), so "one press, one
+            -- notch step" needs no debouncing here.
+            if p1 == keys.w then
+                deskNotch = math.min(15, deskNotch + 1)
+            elseif p1 == keys.s then
+                deskNotch = math.max(0, deskNotch - 1)
+            elseif p1 == keys.leftShift or p1 == keys.rightShift then
+                deskNotch = 0                      -- acknowledgement: EB
+            elseif p1 == keys.a then
+                heldLeft = true
+            elseif p1 == keys.d then
+                heldRight = true
+            elseif p1 == keys.space then
+                deskAck = deskAck + 1              -- vigilance acknowledgement
+            end
+            if heldLeft ~= heldRight then
+                deskSteer = heldLeft and -1 or 1
+            else
+                deskSteer = 0
+            end
+        elseif ev == "key_up" and tw then
+            if p1 == keys.a then
+                heldLeft = false
+            elseif p1 == keys.d then
+                heldRight = false
+            end
+            if heldLeft ~= heldRight then
+                deskSteer = heldLeft and -1 or 1
+            else
+                deskSteer = 0
+            end
         elseif ev == "timer" then
             os.startTimer(0.25)
             local now = os.clock()
+            -- Desk heartbeat: latched notch + steer level + ack counter. 5 Hz is
+            -- plenty for a latched notch and keeps the radio quiet.
+            if tw and now - lastManualTx >= 0.1 then
+                lastManualTx = now
+                pcall(rednet.broadcast, {
+                    desk = true, label = locoName, consist = MU_PROTOCOL,
+                    notch = deskNotch, steer = deskSteer, ack = deskAck,
+                }, MANUAL.protocol)
+            end
             if now - lastDraw >= 0.20 then
                 lastDraw = now
                 -- Prefer the master's snapshot, else the freshest one: a
@@ -1530,6 +1762,12 @@ local function runDisplayTerminal()
                     end
                 end
                 if master then pick = master end
+                -- What this desk is asking for, shown next to the loco's state
+                local deskTag = nil
+                if tw then
+                    deskTag = string.format("DSK%d%s", deskNotch,
+                        deskSteer < 0 and "L" or (deskSteer > 0 and "R" or ""))
+                end
                 if pick then
                     lostWarned = false
                     local d = pick.d
@@ -1541,6 +1779,11 @@ local function runDisplayTerminal()
                         fault = d.fault, redDist = d.redDist, visual = d.visual,
                         latch = d.latch, armed = d.armed, slip = d.slip,
                         slipRatio = d.slipRatio, maxSpeed = d.maxSpeed,
+                        manual = d.manual,
+                        -- the warning blinks so a half-asleep driver notices it
+                        vigWarn = d.vigWarn and ((os.clock() % (2 * MANUAL.blink)) < MANUAL.blink) or false,
+                        vigTrip = d.vigTrip,
+                        desk = deskTag,
                         warn = (age > 1.0) and string.format("STALE %.1fs", age) or nil,
                     })
                 else
@@ -1550,7 +1793,8 @@ local function runDisplayTerminal()
                             "DISPLAY MODE: no snapshot for %.1fs on '%s' - showing LINK LOST",
                             DISP_STALE, MU_DISP_PROTOCOL))
                     end
-                    drawDisplay(dCall, locoName .. "  CAB", monH, { warn = "LINK LOST" })
+                    drawDisplay(dCall, locoName .. "  CAB", monH,
+                        { warn = "LINK LOST", desk = deskTag })
                 end
             end
         end
@@ -1629,6 +1873,28 @@ while true do
     if sender and proto == MU_DISP_PROTOCOL then
         -- Display snapshots are for the cab terminal, not for the driving
         -- loop: drop them silently (no foreign-protocol warning).
+        msg = nil
+    elseif sender and proto == MANUAL.protocol then
+        -- Desk packet. Latch the request, stamp the link and take the
+        -- vigilance acknowledgement counter (a SPACE press on the desk).
+        if type(msg) == "table" and msg.desk
+                and (msg.consist == nil or msg.consist == MU_PROTOCOL) then
+            desk.rx = os.clock()
+            if type(msg.notch) == "number" then
+                desk.notch = math.max(0, math.min(15, math.floor(msg.notch)))
+            end
+            if type(msg.steer) == "number" then
+                desk.steer = math.max(-1, math.min(1, msg.steer))
+            end
+            if type(msg.ack) == "number" and msg.ack ~= desk.ack then
+                desk.ack = msg.ack
+                desk.vigLast = desk.rx
+                if desk.vigTripped then
+                    desk.vigTripped = false
+                    print("VIGILANCE: acknowledged - penalty cleared")
+                end
+            end
+        end
         msg = nil
     elseif sender and proto ~= MU_PROTOCOL then
         if not foreignWarned then
@@ -1778,6 +2044,60 @@ while true do
             level = "EB", setSpeed = 0,
         })
     elseif role == "master" then
+        -- Manual desk arbitration. The safety timers live HERE (not on the
+        -- desk): a lost radio link or a sleeping driver must stop the train
+        -- even if the desk keeps happily transmitting stale wishes.
+        local manualFail, manualFresh = false, false
+        if desk.active then
+            manualFresh = desk.rx > 0 and (now - desk.rx) <= MANUAL.ttl
+            if manualFresh then
+                desk.lostWarned = false
+                desk.override = desk.notch
+                applySteer(desk.steer)
+                if MANUAL.vig then
+                    local since = now - desk.vigLast
+                    if since >= MANUAL.period then
+                        desk.vigWarn = false
+                        if not desk.vigTripped then
+                            desk.vigTripped = true
+                            print(string.format(
+                                "VIGILANCE: no SPACE for %.0fs - traction cut, %.0f%% brake",
+                                MANUAL.period, MANUAL.brake * 100))
+                        end
+                    elseif since >= MANUAL.period - MANUAL.grace then
+                        desk.vigWarn = true
+                    else
+                        desk.vigWarn = false
+                    end
+                    if desk.vigWarn ~= desk.vigPrevWarn then
+                        desk.vigPrevWarn = desk.vigWarn
+                        if desk.vigWarn then
+                            print(string.format(
+                                "VIGILANCE: SPACE due within %.0fs", MANUAL.grace))
+                        end
+                    end
+                end
+            else
+                manualFail = true
+                -- Desk gone. Keep the LATCHED notch so updateRHI() does not see
+                -- EB: entering EB would reset rhi_setSpeed to zero and the set
+                -- speed would never come back (C only freezes, it does not
+                -- restore). Braking is applied by the branch below instead.
+                if not MANUAL.hold then
+                    desk.override = 0
+                end
+                applySteer(0)
+                if not desk.lostWarned then
+                    desk.lostWarned = true
+                    print(string.format(
+                        "MANUAL: no desk packet for %.1fs - braking, set speed %s",
+                        MANUAL.ttl, MANUAL.hold and "held" or "cleared"))
+                end
+            end
+        else
+            desk.override = nil
+            desk.vigWarn = false
+        end
         -- Master: RHI + PID + ramp
         updateRHI(dt, actualSpeed)
         setSpeed = getSetSpeed()
@@ -1789,8 +2109,12 @@ while true do
         -- the train drives normally until the red is inside RED_EB_DIST
         -- blocks, i.e. the axle has effectively reached the signal -> EB
         -- latch (full brake, set speed zero). The driver clears the latch by
-        -- pulling the RHI handle to EB (signal 0). Exempt in visual driving.
-        local handleSig = redstone.getAnalogInput(SIDE_SETSPEED) or 0
+        -- pulling the RHI handle to EB (signal 0) - or the desk's SHIFT key.
+        -- Exempt in visual driving.
+        local handleSig = desk.override
+        if handleSig == nil then
+            handleSig = redstone.getAnalogInput(SIDE_SETSPEED) or 0
+        end
         if redLatch and handleSig == 0 then
             redLatch = false
         end
@@ -1798,15 +2122,40 @@ while true do
             redLatch = true
             rhi_setSpeed = 0
         end
+        -- Diagnostic: WHY did the set speed collapse? One line on the tick the
+        -- effective set speed drops to zero from something non-zero. The
+        -- reason tag is set by whichever branch is responsible below.
+        MANUAL.zeroReason = nil
         if redLatch then
+            MANUAL.zeroReason = "redLatch"
             driveOut, brakeOut = 0, 1.0
             lastDriveOut, lastBrakeOut = 0, 1.0
             setSpeed = 0
-        elseif masterCut then
+        elseif manualFail then
+            -- Desk link lost: full brake. The set speed is KEPT (manualHold):
+            -- a lost packet means the notch reading is missing, not that the
+            -- driver wants to stop, and zeroing it here used to kill the
+            -- target for good (EB resets rhi_setSpeed, C does not restore it).
+            MANUAL.zeroReason = "desk-lost"
             driveOut, brakeOut = 0, 1.0
             lastDriveOut, lastBrakeOut = 0, 1.0
+            if not MANUAL.hold then
+                setSpeed = 0
+            end
+        elseif masterCut then
+            MANUAL.zeroReason = "EB(sig=0)"
+            driveOut, brakeOut = 0, 1.0
+            lastDriveOut, lastBrakeOut = 0, 1.0
+        elseif desk.vigTripped then
+            -- Vigilance penalty: traction cut, service brake (not EB), stays
+            -- applied until the desk acknowledges with SPACE.
+            MANUAL.zeroReason = "vigilance"
+            driveOut, brakeOut = 0, MANUAL.brake
+            lastDriveOut, lastBrakeOut = driveOut, brakeOut
+            setSpeed = 0
         elseif notchBrake > 0 then
             -- B9..B1: direct brake signal 10-sig, set speed zero
+            MANUAL.zeroReason = "B-notch"
             driveOut, brakeOut = 0, notchBrake
             lastDriveOut, lastBrakeOut = 0, notchBrake
         elseif notchNeutral then
@@ -1830,7 +2179,21 @@ while true do
             driveOut = rampOut(d, lastDriveOut, rampDelta)
             brakeOut = rampOut(b, lastBrakeOut, rampDelta)
             lastDriveOut, lastBrakeOut = driveOut, brakeOut
+            if setSpeed <= 0.001 then
+                MANUAL.zeroReason = "handover/PID"
+            end
         end
+        if setSpeed <= 0.001 and MANUAL.lastSpd > 0.1 then
+            print(string.format(
+                "SETSPD->0 by %s | sig=%s notch=%s manual=%s deskAge=%s spd=%.1f red=%s latch=%s brake=%.2f",
+                tostring(MANUAL.zeroReason), tostring(handleSig), tostring(desk.notch),
+                desk.active and "on" or "off",
+                desk.rx > 0 and string.format("%.2fs", now - desk.rx) or "none",
+                actualSpeed,
+                redDist and string.format("%.0f", redDist) or "-",
+                redLatch and "YES" or "no", brakeOut))
+        end
+        MANUAL.lastSpd = setSpeed
         revOut = masterReverse
         level  = notchLevel
         broadcastState(role, {
@@ -1842,9 +2205,10 @@ while true do
         broadcastDisplay({
             role = role, setSpeed = setSpeed, speed = actualSpeed,
             throttle = driveOut, brake = brakeOut, reverse = revOut,
-            level = level, fault = fault, redDist = redDist,
+            level = level, fault = fault or manualFail, redDist = redDist,
             visual = visualDriving, latch = redLatch, armed = calibArmed,
             slip = slipActive, slipRatio = slipRatio,
+            manual = desk.active, vigWarn = desk.vigWarn, vigTrip = desk.vigTripped,
         })
     else
         -- Slave: replicate last master control, flip direction per consist config
@@ -1869,6 +2233,9 @@ while true do
         local flip = masterRel and masterRel.reverse == true or false
         revOut = revOut ~= flip
         lastDriveOut, lastBrakeOut = driveOut, brakeOut
+        -- A loco that is no longer the master must not keep a steer override:
+        -- only the desk-driven master writes it.
+        if desk.applied ~= 0 then applySteer(0) end
         broadcastState(role, nil)
     end
 

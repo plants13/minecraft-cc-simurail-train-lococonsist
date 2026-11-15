@@ -187,4 +187,45 @@ return {
     displayProtocol = nil,     -- nil = "<mu protocol>-disp" (per-consist isolation)
     displayInterval = 0.25,    -- s: master snapshot period; false = do not publish
     displayStale    = 2.0,     -- s: no snapshot for this long -> STALE/LINK LOST
+
+    -- ---- Manual desk (optional, goes with displayMode) ----
+    -- A terminal computer that also has a Simulated linked_typewriter next to
+    -- it becomes a driving desk: the typewriter reports raw key presses, the
+    -- terminal turns them into a notch (0..15, same mapping as the RHI handle)
+    -- and a steer request, and forwards both to the loco on its own protocol.
+    -- Keys are bound in the typewriter's own GUI (a key with no frequency
+    -- binding is NOT reported at all). Suggested: W/S notch, A/D steer,
+    -- LEFT SHIFT = EB, SPACE = vigilance.
+    -- The loco only ENTERS manual mode when told to (command "Manual" at its
+    -- terminal); a desk alone never takes over. While manual, a packet older
+    -- than manualTimeout fails safe (traction cut + EB).
+    manualProtocol = nil,      -- nil = "<mu protocol>-manual"
+    manualTimeout  = 2.5,      -- s: no desk packet for this long -> braking (see below)
+    -- A dropped packet means "the notch reading is missing", NOT "stop": on a
+    -- server one lagging loop iteration can exceed the timeout, and clearing
+    -- the set speed there used to destroy the target for good (EB resets it,
+    -- C only freezes it). true  = brake but keep the set speed
+    --                             false = old behaviour, clear the set speed too
+    manualHoldSpeedOnLoss = true,
+    -- Boot default for manual mode. The console command "Manual" overrides it
+    -- at runtime AND persists the choice to manual.json, and that file wins on
+    -- the next boot (so a reboot cannot silently hand control back to a
+    -- physical handle that happens to sit in a drive notch). Keep false unless
+    -- this loco is always driven from a desk.
+    manualDefault = false,     -- true = start in manual mode (EB until the desk talks)
+
+    -- ---- Vigilance (deadman) device, manual mode only ----
+    -- Real locomotives demand an acknowledgement every so often, so a driver
+    -- who falls asleep or walks away cannot keep the train rolling. A SPACE
+    -- press on the desk counts as the acknowledgement.
+    --   after vigilancePeriod seconds without a press the warning window
+    --   opens for vigilanceGrace seconds (the display blinks), and if the
+    --   press still has not come, traction is cut and vigilanceBrake service
+    --   braking is applied. It clears on the next SPACE press.
+    -- Off by default: it is a comfort/safety feature for long runs, and it
+    -- needs a real desk (a keyboard) to be usable at all.
+    vigilanceEnabled = false,  -- true = require a SPACE press every period
+    vigilancePeriod  = 30.0,   -- s: a press is due this often
+    vigilanceGrace   = 15.0,   -- s: blinking warning window before the penalty
+    vigilanceBrake   = 0.5,    -- service brake strength applied on timeout (0..1)
 }
