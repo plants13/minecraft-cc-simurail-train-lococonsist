@@ -1,379 +1,501 @@
-# 机车重联控制系统 —— 配置与部署说明
+# 机车重联控制系统 —— 配置与部署
 
-> 本说明对应**合并版**：单文件 `startup.lua`，换向拉杆选主从；驱动/制动/换向走 **Simurail 物理转向架的 CC 外设**（唯一输出通道，无红石回退），冒进防护读**转向架探针**。
-> 所有脚本/配置必须**纯 ASCII**——CC:Tweaked 加载不了中文注释（这份文档给人看，放本地，别复制进游戏电脑）。
+本文面向**部署者**：怎么接线、怎么改配置、怎么开车、出问题怎么查。
+工作原理综述见 [`系统工作原理.txt`](系统工作原理.txt)，功能概览见 [`README.md`](README.md)。
 
----
+> **纯 ASCII 铁律**：所有 `.lua` 与游戏内配置文件必须是纯 ASCII。CC:Tweaked 加载不了含非 ASCII 字符的脚本，开机直接报错。中文只写在这类 `.md` / `.txt` 里，**不要复制进游戏电脑**。
 
-## 0. 架构总览
+## 目录
 
-每台机车电脑上放 3 个文件：
-
-| 文件 | 作用 | 每车是否相同 |
-| --- | --- | --- |
-| `startup.lua` | 控制程序（主机+从机合一，拉杆决定角色） | 相同 |
-| `config_locomodel.lua` | 本车硬件/PID/外设配置 | 每车一份，按接线可不同 |
-| `mu_config.lua` | 重联配置（协议名 + 其他车相对本车方向） | 每车一份，视角不同 |
-| `door_ctrl.lua` | 车门集控（独立电脑，接线面写在脚本顶部，见第六节） | 相同 |
-
-- 电脑身份用 `label set <名称>` 设置（大小写敏感，重启不丢）。
-- **接线角色分工**：
-
-| 功能 | 通道 |
-| --- | --- |
-| 驱动（油门） | Simurail 转向架 CC 外设 `setMaxStress`（±128，应力=网络消耗） |
-| 制动 | Simurail 转向架 CC 外设 `setBrakeStrengthOverride`（0..1） |
-| 换向 | 驱动应力符号（负 = 反向），不再用倒挡齿轮箱红石 |
-| 红灯（冒进防护） | **Simurail 转向架探针** `getProbeOccupiedSignalDistance`（固定轴，读轨道距离） |
-| 重联通信 | 无线 modem（rednet） |
+1. [系统组成](#一系统组成)
+2. [硬件接线](#二硬件接线)
+3. [`config_locomodel.lua` 参考](#三config_locomodellua-参考)
+4. [`mu_config.lua` 重联配置](#四mu_configlua-重联配置)
+5. [部署步骤（按角色）](#五部署步骤按角色)
+6. [日常操作](#六日常操作)
+7. [安全与故障语义](#七安全与故障语义)
+8. [排障](#八排障)
+9. [附录：外设与探针事实](#九附录外设与探针事实)
 
 ---
 
-## 一、模式选择（换向拉杆）
+## 一、系统组成
 
-`sideReverse` 接的拉杆是**模拟量**，三个区间决定角色与方向：
+一台车至少一台电脑跑 `startup.lua`。同一份脚本有四种运行形态，由配置里的 `displayMode` / 运行时命令决定：
+
+| 角色 | 跑什么 | 需要什么硬件 | 说哪个协议 |
+| --- | --- | --- | --- |
+| **运控车**（主机/从机） | `startup.lua` | 转向架外设、手柄、模式拉杆、显示器（可无）、速度传感器（可无）、无线 modem、可选应力表 | 控制 `<协议>`、遥显 `<协议>-disp`、手动台 `<协议>-manual` |
+| **驾驶台遥显终端** | 同一份 `startup.lua`，`displayMode = true` | 电脑 + 显示器 + 无线 modem（**不需要**转向架/传感器/手柄/拉杆） | 只听 `<协议>-disp` |
+| **手动驾驶台** | 同上（`displayMode = true`）+ 打字机 | 再看：`linked_typewriter` 贴在终端旁 | 发 `<协议>-manual` |
+| **车门集控** | `door_ctrl.lua` | 左右门脉冲输入 + 两路常电平输出 + 无线 modem | `loco-door` |
+
+```
+                  无线 modem（rednet）
+   运控车 A  ⇄⇄⇄  运控车 B      （<协议>：状态 + 控制数据，10 Hz）
+      ⇢ 驾驶台终端              （<协议>-disp：主机快照，4 Hz）
+      ⇠ 手动驾驶台               （<协议>-manual：档位 + 转向 + 警惕确认，10 Hz）
+      ⇢ 车门电脑 ×N             （loco-door：开关命令 + 0.5 s 状态心跳）
+```
+
+**角色与方向由模式拉杆（`sideReverse` 模拟红石量）实时决定**，运行中可切：
 
 | 模拟值 | 角色 | 方向 |
 | --- | --- | --- |
 | 0-4 | 主机 | 前进 |
-| 5-10 | 从机 | — |
+| 5-10 | 从机 | 跟随主机（按 `mu_config` 取反） |
 | 11-15 | 主机 | 后退 |
 
-- 拉杆运行中可实时切换；从机不读自己的拉杆方向，方向跟随主机（按 mu_config 取反）。
-- **全网安全**：同一协议组内**恰好 1 台主机**才正常；0 台或多台主机 → 全列切断牵引 + EB（全制动）。
+**全网安全**：同一协议组内恰好 1 台主机。0 台或多台 → 全列切牵引 + EB。
 
 ---
 
-## 二、config_locomodel.lua —— 本车配置
+## 二、硬件接线
 
-```lua
-return {
-    maxSpeed = 50.0,               -- 最高速度 (m/s)，档位设定速度上限
+### 运控车（每台机车）
 
-    -- 输入面（红灯已改为转向架探针读取，不再占红石输入）
-    sideSetSpeed  = "top",         -- 输入：RHI 手柄 0-15（档位）
-    sideReverse   = "right",       -- 输入：模式拉杆 0-4前进 / 5-10中立 / 11-15后退
-    sideMonitor   = "left",        -- 输出：显示器（可无）
-    sideModem     = "front",       -- 外设：无线调制解调器面（rednet）
+| 接口 | 方式 | 必需 | 说明 |
+| --- | --- | --- | --- |
+| 手柄（`sideSetSpeed`） | 模拟红石输入 0-15 | ✅ | 档位；也可由红石链接/遥控器无线传进来 |
+| 模式拉杆（`sideReverse`） | 模拟红石输入 0-15 | ✅ | 决定主从与方向 |
+| 转向架外设 | **贴面或同一有线网络** | ✅ | 驱动/制动/换向/转向/探针全走它，**无红石回退** |
+| 显示器（`sideMonitor`） | 外设（可缺） | — | 缺了只是不画 |
+| 无线 modem（`sideModem`） | 外设 | — | 缺了重联/遥显/手动台全停（单机仍可开） |
+| 速度传感器 | `velocity_sensor`（贴面/有线） | — | 缺了实际速度显示 `N/A`，PID 无速度反馈（**不可用**） |
+| 应力表（可选） | `Create_Stressometer` | — | 接在**被这些转向架消耗的同一条动力网络**上 |
+| 变速箱 | 常亮红石（火把/拉杆） | ✅ | 转向架必须有转速 `getSpeed` 才出力 |
 
-    -- Simurail 转向架 CC 外设（驱动/制动/换向，唯一输出通道，无回退）
-    bogeyDriveMax = 128.0,         -- 驱动应力范围：油门满档 → ±128（应力=动力网络消耗）
+### 驾驶台遥显终端 / 手动台
 
-    visualMaxSpeed = 10.0,         -- 目视行车限速 (m/s = 36 km/h，运行中可开)
-
-    -- 冒进防护（转向架探针，替代原红石电平输入）
-    redProbeFront    = true,       -- 固定轴：true=前端轴（默认），false=后端轴
-    redProbeWindow   = 128.0,      -- 探针扫描长度（格），启动时写入每个转向架
-    redEbDistance    = 4.0,        -- 红灯进入这个距离（格）内直接 EB
-
-    -- 控制循环周期
-    pidDt = 0.05,                  -- 循环节奏 20Hz（>红石刻 10Hz，利于平顺）
-
-    -- PID 参数（统一 PID：输出 = 驱动应力 0..128 / 制动强度 0..1）
-    pidKi = 4.3,                   -- 积分（0..128 刻度，原 0..15 刻度 0.5 ×8.53）
-    pidKd = 4.3,                   -- 微分（同上换算）
-    pidKpNear = 6.8, pidKpMid = 10.2, pidKpFar = 21.3,   -- 分段增益（0..128 刻度）
-    nearThreshold = 0.8, farThreshold = 5.0,           -- 增益分段边界 (m/s)
-    pidDeadband = 0.15,            -- 死区：设定点附近不动作
-    noBrakeWindow = 0.5,           -- 略超速不制动（滑行窗口）
-    maxOutputDelta = 17.0,         -- 输出斜坡（每 0.1s 参考应力变化，0..128 刻度）
-    brakeScale = 0.2,              -- 制动强度上限：满驱动输出时制动 = 0.2
-    emergencyBrakeKp = 0.1,        -- 急停：制动强度 = 速度(m/s) × 0.1 × brakeScale
-
-    -- 性能标定参数（Calibrate 命令）
-    calibAccelDur       = 3.0,     -- 全油门加速测量时长 (s)
-    calibBrakeStrength  = 0.5,     -- 制动段使用的制动强度（0.5 = 50%）
-    calibPlateauTime    = 2.0,     -- 速度多久不再增长就算到顶 (s)
-    calibPlateauEps     = 0.1,     -- 单次速度增量超过此值算"还在加速" (m/s)
-    calibMinTopSpeed    = 5.0,     -- 最高速度低于此值判定标定失败 (m/s)
-    calibStartClearance = 64.0,    -- 开始标定所需的前方清空距离 (格)
-    calibRunTimeout     = 120.0,   -- 爬升阶段兜底超时 (s)
-    calibBrakeTimeout   = 60.0,    -- 制动段超时下限 (s)，实际按最高速度放大
-    calibSettle         = 0.5,     -- 输出切换后的稳定时间 (s)
-
-    -- 驾驶台遥显（可选）：displayMode = true 的电脑只画面板，不驱动
-    displayMode     = false,       -- true = 本机是只读显示器终端
-    displayProtocol = nil,         -- nil = "<mu 协议>-disp"
-    displayInterval = 0.25,        -- s：主机快照周期；false = 不发布
-    displayStale    = 2.0,         -- s：超过这么久没快照 → STALE / LINK LOST
-}
-```
-
-**要点**：
-- **红石输出面已彻底移除**：`sideBrake` / `sideThrottle` / `sideRevGearbox` 三个键与对应代码都已删除，驱动/制动/换向只走转向架外设，**没有回退通道**（外设找不到就只打印错误并保持无输出）。⚠️ `sideThrottle` 原来是给变速箱供转速（驱动前提是转向架有转速 `getSpeed`）——现在**变速箱必须由常亮红石（红石火把/拉杆）直接供能**，否则车不动。
-- **冒进防护（转向架探针）**：主机读**固定轴的探针数据**（`redProbeFront`，默认 `true` = 前端轴；`getProbeOccupiedSignalDistance(redProbeFront)`）——前方最近"对本车红灯"的信号边界距离（格，沿轨道弧长，`-1` = 窗口内无红灯）。**不做接近减速**：列车按司机操作正常行驶，只有红灯进入 `redEbDistance`（默认 4 格，视为已到信号机）才触发 **EB 锁存**（全制动 + 设定归零，**须把手柄拉到 EB（信号 0）确认**）；4 格以外只在显示器显示 `R:距离`。**后退位（拉杆 11-15）豁免**：探针轴固定在转向架一端，倒车时它朝车尾，保护方向是反的，靠司机目视。目视行车豁免；**从机不读探针**（跟随主机广播 ctrl，全列一起停）。不需要速度传感器即可工作。
-- **RHI 档位与设定速度**：0 EB / 1-9 B9..B1 / 10 N / 11-12 K1-K2 降速 / 13 C 保持 / 14-15 K3-K4 提速。**从 EB、B 档或 C 拨回 N/K 区时，设定速度自动改写为当前实际速度**：EB/B 把设定速度压在 0、C 把它冻结在旧值，若直接拨到 K 档会因设定与实际差距过大而猛加/猛减；现在回到 N/K 区就从当前速度接着走。N/K 区内部换档不重置，K1-K4 的 5/1 km/h/s 斜坡照常；程序重启时手柄若已在 N/K 区也按当时实际速度接管。
-- **运行时指令**：终端输入命令 + 回车（大小写不敏感）：`VisualDriving`（或 `vd`）开关目视行车；`Calibrate`（或 `calib`）性能标定（两步确认，见下）；`help` 列出命令。
-- **性能标定**：先把 RHI 手柄拉到 **EB 位**，输入 `calib` 进入待命（显示器 `ARM`；EB 位再输一次解除），再**拉到 N 位启动**。前置：主机位 + 停车 + 有速度传感器 + 前方清空距离 ≥ `calibStartClearance`。流程：**全牵引爬到最高速度**（速度在 `calibPlateauTime` 内增量不超过 `calibPlateauEps` 即认为到顶，或先撞上 `maxSpeed` 设定上限，取较低者）→ 惰行 `calibSettle` → **按 `calibBrakeStrength`（默认 50%）制动到停车**。拟合**按速度分箱**（1 m/s 一箱，取箱内首末样本算平均速率，跨时 ≥ 0.25 s 才用）再做最小二乘，得到两条速度相关曲线：`a(v)=a0+a1·v`（全牵引，**加速度随速度上升线性衰减**，`a1` 应为负，`a(v)=0` 处即牵引极限 `vmax`）和 `d(v)=d0+d1·v`（全制动，由 50% 实测值线性归一化）。分箱而不是用逐 tick 斜率，是因为 20 Hz 下接近顶速时每拍速度变化极小，量化噪声会淹没真实斜率。结果写 `calib.json` **v3**：`accel.a0/a1/vmax/rms/r2/bins`、`brake.d0/d1/mps2/mps2Full/rms/r2`、`topMps`、以及 `profile`（每 2 m/s 采样表，外部列控可直接读）。标定完成立即生效并打印曲线、拟合质量（rms/r²）、"0→顶速需多少秒、顶速全制动需多少格"，若曲线零点与实测顶速差得远会额外提示。标定中故障/红灯逼近自动中止并全制动；结束保持全制动到停稳（从机同步）。重联时从机跟随一起动，测的是**整列**性能。
-- **K 档速率与 pidDt 解耦**：每拍实测 dt，设定速度按 `5/1 km/h/s × dt` 增减、PID 积分/微分、输出斜坡都按 dt 算。
-- 文件头注释里的 `config_swd1p.lua / SWD1P` 是历史残留，不影响运行。
-
----
-
-## 二·五、Simurail 转向架 CC 外设（驱动层）
-
-- 外设类型：`Simurail_PhysicsBogey`（有线网络/贴面可达，`peripheral.getNames()` 可找）。
-- **驱动**：`setMaxStress(±bogeyDriveMax)` —— 应力 = |maxStress| × |multiplier|，脚本启动时把 multiplier 锁 1，所以**应力 = maxStress 绝对值，直接反映动力网络消耗**；符号决定方向。
-- **制动**：`setBrakeStrengthOverride(0..1)`，与红石/遥控/导航 4 路取 max，CC 覆盖直通不平方。
-- **转速前提**：转向架必须有动力学转速（`getSpeed`）才出力——变速箱/动力网络负责，电脑不再管（见上"删掉的红石输出面"）。
-- **外设调用节流**：驱动/制动只在数值变化时才调用外设（防 mainThread 任务拖垮主循环）；驱动缓存记录的是**带符号**应力，所以换向时即使幅值没变也会重新下发。重启后外设数值复位，无需额外同步。
-- **外设缺失**：启动扫描不到 `Simurail_PhysicsBogey` 时只打印 `ERROR: no Simurail_PhysicsBogey peripheral - this vehicle cannot drive or brake`，此时车**既不能牵引也不能制动**（无红石回退），先查接线/区块加载再动车。
-- 转向架 GUI 里的"应力"就是 maxStress 基数——CC 设置的倍率不显示在 GUI，用 `hasStressMultiplierOverride()`/`getStressMultiplier()` 判断。
-- **超载保护（可选外设 `Create_Stressometer`）**：驱动强度同时就是网络应力消耗，`Σ|maxStress|×|multiplier|×|网络RPM|` 一旦超过产能，Create 把整条网络判为 overstressed、`getSpeed()` 返回 0，转向架**牵引力整体归零**（不是变小，是归零——油门越大越死）。脚本每拍读一次应力表：`used > capacity` 时把驱动上限压到 `当前值 × capacity/used × stressGuardMargin`，之后冻结 0.3 s，再仅在 `used/capacity < stressGuardReleaseRatio`（默认 0.85，宽回差）时按 `stressGuardRelease`（默认 8/s）慢慢放回。**没有应力表外设时整段逻辑不生效**，行为与接入前完全一致。制动不受影响（制动力公式里没有应力项），压驱动不会削弱停车能力。标定运行中触发保护会按 `stressGuardCalibAbort` 中止——那时不是全牵引，拟合出的加速度曲线不可信。
-- 应力表必须接在**被这些转向架消耗的同一条动力网络**上，并且电脑能通过相邻面或同一有线网络看到它（脚本用 `peripheral.getNames()` 扫，和找转向架的方式一样）。
-
----
-
-## 二·六、转向架探针（冒进防护的数据源）
-
-`startup.lua` 的冒进防护不再读红石，改为读 `Simurail_PhysicsBogey` 的探针接口。要点（都是从 Simurail 源码核对出来的）：
-
-| 事实 | 说明 |
+| 接口 | 说明 |
 | --- | --- |
-| 扫描长度 | `getProbeDistance()` 是**配置项**（格），**默认 0 = 不扫描**。脚本启动时把 `redProbeWindow` 写入每个转向架，所以不用手动设 |
-| 刷新频率 | 服务端每 `bogeyProbeInterval` tick 扫一次（配置默认 **5 tick = 0.25 s**，范围 1..40）；CC 读到的是上一次扫描的缓存 |
-| 距离单位 | 沿轨道的**弧长（格）**，不是直线距离；`-1` = 窗口内没有目标 |
-| 轴的选择 | `getProbe*(true)` = 转向架**前端轴**，`false` = **后端轴**；每根轴朝**自己那一端**的方向看。与行驶方向/换向**无关**（固定轴），所以必须让选中的轴指向行驶方向（`redProbeFront`，默认 `true` = 前端轴） |
-| 只报最近一个 | 探针窗口内**第一个**符合条件的边界才会被记录；更远的目标看不到 |
-| 朝向过滤 | `getProbeOccupiedSignalAligned()` = 该边界在我们要进入的那一侧**装有信号方块**。为 `false` 时脚本忽略它（不是给我们看的信号），但因此也看不到它后面的信号 |
-| 红灯判定 | `getProbeOccupiedSignalDistance` 只在信号被**强制红**、或闭塞分区被**别的重联组**占用时才有值（本组占用不算），`getProbeOccupiedSignalForced()` 区分是否强制红 |
-| 站台信息 | `getProbeStationDistance/Name/Id/Pos/BlockPos/Powered`，同样 -1/nil 表示无 |
-| 断点 | `getProbeDiscontinuityDistance` 只在"前方没有后续轨道"时给值；**挡车器（buffer）不算**（模组里那条路径没有置 blocked） |
-| 已知小瑕疵 | 模组 `reset()` 没有清 `stationId`，可能出现距离为 -1 但 `stationId` 仍是上一个站的残留——用之前先判 `stationDistance >= 0` |
+| 显示器（`sideMonitor`） | 必需 |
+| 无线 modem（`sideModem`） | 必需 |
+| `linked_typewriter` | 手动台必需，**贴终端或同有线网络**，键位在打字机自己的界面里绑 |
 
-诊断用 `bogey_probe.lua`：它会打印两个轴的探针快照（占用信号距离/朝向/强制红、普通信号、站台、断点）。
+### 车门电脑（每车一台，独立）
+
+接线面写在 `door_ctrl.lua` 顶部常量里（不走 `config_locomodel.lua`）：
+
+| 常量 | 默认面 | 作用 |
+| --- | --- | --- |
+| `SIDE_IN_L` / `SIDE_IN_R` | right / left | 左右门按钮脉冲输入（上升沿翻转） |
+| `SIDE_OUT_L` / `SIDE_OUT_R` | front / back | 左右门常电平输出（开门期间为高） |
+| `SIDE_MODEM` | top | 无线 modem |
 
 ---
 
-## 三、mu_config.lua —— 重联配置（最容易写错）
+## 三、`config_locomodel.lua` 参考
+
+每台电脑一份，按本机接线与角色改。文件内已带英文注释，下面是分组速查（默认值即仓库版本）：
+
+### 基本
+
+| 键 | 默认 | 说明 |
+| --- | --- | --- |
+| `maxSpeed` | `50.0` | 最高速度 m/s，设定速度上限 |
+| `pidDt` | `0.05` | 控制循环周期 s（20 Hz）。K 档速率、PID、斜坡都按实测 dt 缩放，改它只影响响应度 |
+| `visualMaxSpeed` | `10.0` | 目视行车限速 m/s（36 km/h） |
+
+### 面位（红石输入 / 外设侧）
+
+| 键 | 默认 | 说明 |
+| --- | --- | --- |
+| `sideSetSpeed` | `"top"` | RHI 手柄模拟输入面 |
+| `sideReverse` | `"right"` | 模式拉杆模拟输入面 |
+| `sideMonitor` | `"left"` | 显示器外设面 |
+| `sideModem` | `"front"` | 无线 modem 面 |
+
+> **红石输出面已移除**：老配置里的 `sideBrake` / `sideThrottle` / `sideRevGearbox` 三个键不再读取，留着无害但无效。
+
+### 驱动
+
+| 键 | 默认 | 说明 |
+| --- | --- | --- |
+| `bogeyDriveMax` | `128.0` | 驱动应力范围：PID 输出 0..128 → `setMaxStress(±128)`；应力 = 动力网络消耗 |
+
+### PID（统一控制器：正输出 = 驱动应力，负输出 = 制动强度）
+
+| 键 | 默认 | 说明 |
+| --- | --- | --- |
+| `pidKpNear` / `pidKpMid` / `pidKpFar` | `6.8` / `10.2` / `21.3` | 分段比例增益（0..128 刻度），误差越大越激进 |
+| `nearThreshold` / `farThreshold` | `0.8` / `5.0` | 增益分段边界 m/s |
+| `pidKi` / `pidKd` | `4.3` / `4.3` | 积分 / 微分（0..128 刻度） |
+| `pidDeadband` | `0.15` | 死区 m/s：误差在此内不动作、冻结积分 |
+| `noBrakeWindow` | `0.5` | 略超速时不制动而是惰行（避免反复点刹） |
+| `maxOutputDelta` | `17.0` | 输出斜坡：每 0.1 s 允许的应力变化（EB/B/N 不斜坡） |
+| `brakeScale` | `0.2` | 制动强度上限系数：满驱动输出 → 0.2 制动 |
+| `emergencyBrakeKp` | `0.1` | 设定速度为 0 时的制动强度 = 速度 × 该系数 × `brakeScale` |
+
+> ⚠️ **不要出现两行 `pidKpFar`**。历史上有一份配置里 `21.3` 后面跟了一行 `2.5`（旧 0..15 刻度的残留），Lua 表构造后值覆盖前者，表现为"远区无力、误差大反而更软"。
+
+### 冒进防护（转向架探针）
+
+| 键 | 默认 | 说明 |
+| --- | --- | --- |
+| `redProbeFront` | `true` | 读哪根轴的探针：`true` 前端轴 / `false` 后端轴。**必须指向行驶方向**，反了就对后方红灯制动 |
+| `redProbeWindow` | `128.0` | 探针扫描长度（格），启动时写入每个转向架（模组默认 0 = 不扫描） |
+| `redEbDistance` | `4.0` | 红灯进入这个距离内 → EB 锁存（视为已到信号机，不做接近减速） |
+
+### 性能标定
+
+| 键 | 默认 | 说明 |
+| --- | --- | --- |
+| `calibAccelDur` | `3.0` | 全牵引加速测量窗口 s |
+| `calibBrakeStrength` | `0.5` | 制动段使用的制动强度（0.5 = 50%） |
+| `calibPlateauTime` / `calibPlateauEps` | `2.0` / `0.1` | 速度这么久没涨超过 eps 就认为到顶 |
+| `calibMinTopSpeed` | `5.0` | 顶速低于此判定标定失败 m/s |
+| `calibStartClearance` | `64.0` | 开始标定所需的前方无红灯距离（格） |
+| `calibRunTimeout` / `calibBrakeTimeout` | `120.0` / `60.0` | 爬升/制动段兜底超时 s |
+| `calibSettle` | `0.5` | 输出切换后的稳定时间 s |
+
+### 过应力保护（可选，需 `Create_Stressometer`）
+
+| 键 | 默认 | 说明 |
+| --- | --- | --- |
+| `stressGuardMargin` | `0.95` | 超载时把驱动上限压到 `当前值 × capacity/used × 该系数` |
+| `stressGuardReleaseRatio` | `0.85` | 仅在 `used/capacity` 低于此值时才放回上限（宽回差，防自泵） |
+| `stressGuardRelease` | `8.0` | 上限恢复速率（0..128 刻度每秒） |
+| `stressGuardCalibAbort` | `true` | 标定中触发保护则中止（此时不是全牵引，曲线不可信） |
+
+### 空转防护（可选，默认关）
+
+| 键 | 默认 | 说明 |
+| --- | --- | --- |
+| `slipGuardEnabled` | `false` | 总开关。**只在固定编组、或每次改编组后重标定后打开** |
+| `slipGuardRatio` | `0.45` | `实测加速度/标定预期` 低于此判为打滑 |
+| `slipGuardMinSpeed` / `slipGuardMinStress` | `2.0` / `24.0` | 低于这些速度/应力不下结论（噪声大） |
+| `slipGuardCut` / `slipGuardFloor` | `0.55` / `32.0` | 每次判定乘性削减驱动上限，且不低于下限 |
+| `slipGuardRelease` / `slipGuardHold` | `10.0` / `0.4` | 恢复速率与削减后冻结时间 |
+| `slipGuardFilter` | `0.30` | 加速度平滑窗口 s |
+
+> 为什么不默认开：预期加速度来自**某一固定编组**标定的曲线，机辆模式频繁摘挂车，真实质量变了曲线没变，这个偏差会被当成打滑 → 正常轮子被砍牵引。
+
+### 驾驶台遥显（`displayMode`）
+
+| 键 | 默认 | 说明 |
+| --- | --- | --- |
+| `displayMode` | `false` | `true` = 本机是**只读显示终端**，不再控车 |
+| `displayProtocol` | `nil` | `nil` = `"<协议>-disp"`；手填则两端一致 |
+| `displayInterval` | `0.25` | 主机快照周期 s；`false` = 主机不发布（省无线流量） |
+| `displayStale` | `2.0` | 超过这么久没快照 → `LINK LOST` |
+
+### 手动驾驶台
+
+| 键 | 默认 | 说明 |
+| --- | --- | --- |
+| `manualProtocol` | `nil` | `nil` = `"<协议>-manual"`；手填则两端一致 |
+| `manualTimeout` | `2.5` | 主机超过这么久没收到驾驶台包 → 制动（见下条） |
+| `manualHoldSpeedOnLoss` | `true` | 丢包时**保留设定速度**只制动；`false` = 连设定速度一起清零（旧行为） |
+| `manualDefault` | `false` | 开机默认是否进手动模式；**`manual.json` 存在时以文件为准** |
+
+### 警惕键（仅手动模式）
+
+| 键 | 默认 | 说明 |
+| --- | --- | --- |
+| `vigilanceEnabled` | `false` | 开启后必须周期按 `Space` |
+| `vigilancePeriod` | `30.0` | 多久要确认一次 s |
+| `vigilanceGrace` | `15.0` | 到期前多久开始闪 `VIG?` |
+| `vigilanceBrake` | `0.5` | 超时后施加的**常用制动**强度（不是 EB） |
+
+### 文件名
+
+配置文件名写死在脚本里，改名要同步改：
+
+| 被加载的文件 | 在 `startup.lua` 里的位置 |
+| --- | --- |
+| `config_locomodel.lua` | 第 0 节 `local cfg = dofile("config_locomodel.lua")` |
+| `mu_config.lua` | `local muOK, muCfg = pcall(dofile, "mu_config.lua")` |
+
+---
+
+## 四、`mu_config.lua` 重联配置
 
 ```lua
 return {
-    protocol = "loco-mu",         -- 协议名：同一组内的车必须逐字符一致
+    protocol = "loco-mu",      -- 同一组内逐字符一致
     others = {
-        -- 键 = 其他车的电脑 label，值 = 该车相对【本车】的方向
-        ["对方车label"] = { reverse = true },   -- true = 对方与本车反向（车头对车头）
-        ["另一台车label"] = { reverse = false }, -- false = 同向
+        -- 键 = 【对方】电脑的 label；值 = 对方相对【本车】的方向
+        ["YL56U2_9002"] = { reverse = true },   -- 车头对车头
+        ["YL56U2_9003"] = { reverse = false },  -- 同向
     },
 }
 ```
 
-**铁律**：
-1. **自己不出现在自己的表里**——`others` 只列"除自己外"的车。
-2. **键必须是"对方"的 label**——从机靠 `others[主机label].reverse` 决定是否取反；查不到就不换向（默认同向）。
-3. **reverse 是"对方相对我"**：对方车头对着我 → `true`；同向 → `false`。
-4. **protocol 组内保持一致、组间必须不同**——protocol 是隔离手段，一组（如两台）共用一个名字；不同组的车互不干扰。
+**四条铁律**：
 
-**双机示例**（车头对车头，两台一组）：
+1. **自己不出现在自己的 `others` 里**——只列"除自己外"的车。
+2. **键必须是对方的 label**——从机靠 `others[主机label].reverse` 决定是否取反；查不到就按同向（典型错误是把主机那份复制给从机）。
+3. **`reverse` 是"对方相对我"**：对方车头朝我 → `true`；同向 → `false`。
+4. **`protocol` 组内一致、组间必须不同**——这是隔离手段。
 
-9001 电脑的 mu_config.lua：
+**双机示例**（车头对车头）：
+
 ```lua
-return {
-    protocol = "grp-a",
-    others = { ["YL56U2_9002"] = { reverse = true } },
-}
+-- 9001 那台
+return { protocol = "grp-a", others = { ["YL56U2_9002"] = { reverse = true } } }
+
+-- 9002 那台
+return { protocol = "grp-a", others = { ["YL56U2_9001"] = { reverse = true } } }
 ```
 
-9002 电脑的 mu_config.lua：
-```lua
-return {
-    protocol = "grp-a",
-    others = { ["YL56U2_9001"] = { reverse = true } },
-}
+两台内容**不一样是正常的**。四个车 = 两个组：组 A 用 `grp-a`，组 B 用 `grp-b`，各组 `others` 只列同组另一台。
+
+---
+
+## 五、部署步骤（按角色）
+
+### A. 运控车（最少一台）
+
+1. `label set <名称>`（与 `mu_config` 的键一致）
+2. 放三个文件：`startup.lua`、`config_locomodel.lua`、`mu_config.lua`
+3. 改 `config_locomodel.lua` 的面位（手柄/拉杆/显示器/modem 接在哪些面）
+4. 改 `mu_config.lua`：协议名 + 对方 label 与相对方向
+5. 接线：见[第二节](#二硬件接线)；转向架**必须有线/贴面可达**，变速箱**必须常亮红石**
+6. 开机。看启动横幅逐条确认：
+
+```
+Bogey peripherals found: 1              <- 转向架找到几个
+Stress gauge found: N - overstress ...  <- 应力表（可选）
+Performance curve: none - run Calibrate <- 标定曲线是否已加载
+Network up on protocol 'loco-mu'        <- 无线网络
+Red protection: probe front axle, window 128 blocks, EB inside 4 blocks
 ```
 
-> 两台内容**不一样是正常的**（视角不同）。把同一份复制给两台是典型错误——从机会查不到主机的键 → 不换向。
+7. 拉杆扳到前进/后退 → 控制台打印 `Lever: 0 -> master`，随后 `OK: 1 master on network`
 
-四台车 = 两个重联组：组 A（9001/9002）protocol 用 `grp-a`，组 B（9003/9004）用 `grp-b`，各组 others 只列同组另一台。
+### B. 驾驶台遥显终端
 
----
+1. 放 `startup.lua` + `config_locomodel.lua` + `mu_config.lua`（**`mu_config` 只用来推协议名**）
+2. `config_locomodel.lua` 里设 `displayMode = true`，`sideMonitor` / `sideModem` 按实际面
+3. 接显示器 + 无线 modem，开机看到 `Display terminal started: protocol '<协议>-disp'`
+4. 终端**不进控制环**，也不会被算作主机；放几台都行
 
-## 四、部署步骤
+### C. 手动驾驶台（可选，在 B 基础上）
 
-1. 每台车 `label set <自己的名字>`（与 mu_config 里 others 的键对应）。
-2. 复制 3 个文件到每台车：`startup.lua`、`config_locomodel.lua`、`mu_config.lua`；车门电脑另放 `door_ctrl.lua`（可选，见第六节）。
-3. 每台车按自己视角改 `mu_config.lua` 和 `config_locomodel.lua`（接线面）。
-4. **接线**：`sideSetSpeed`/`sideReverse` **两个输入面** + 显示器 + 无线 modem；**转向架外设必须有线/贴面可达（无红石回退，探针也走它）**；变速箱用常亮红石供转速。红灯不再接红石，冒进防护读转向架探针。
-5. 把想当主机的车拉杆扳到前进/后退，其余中立。开机即运行。
+1. 终端旁（贴面或同一有线网络）放 `simulated:linked_typewriter`
+2. 在打字机界面里给 `W` `S` `A` `D` `左Shift` `Space` **各绑一个频率**（不用接接收器；没绑频率的键不会被上报）
+3. 开机确认 `Desk: linked_typewriter on '<外设名>'`
+4. **到运控车终端输 `Manual` 才进入手动模式**（驾驶台单方面抢不走控制）；模式会写 `manual.json` 持久化
 
----
+### D. 车门电脑（可选，每车一台）
 
-## 五、改机车配置文件名
-
-`config_locomodel.lua` 的名字在脚本里写死，改名要同步改脚本。合并版只有**一处**：
-
-| 文件 | 位置 | 代码 |
-| --- | --- | --- |
-| `startup.lua` | 第 0 节 | `local cfg = dofile("config_locomodel.lua")` |
-
-`mu_config.lua` 同理，`startup.lua` 里 `pcall(dofile, "mu_config.lua")` 一处。
+放 `door_ctrl.lua`，改脚本顶部 5 个面常量，`label set <车号>_door`。行为见 `door_ctrl.lua` 顶部注释。
 
 ---
 
-## 六、车门集控（door_ctrl.lua）
+## 六、日常操作
 
-每节车（或车门附近）一台**独立电脑**运行 `door_ctrl.lua`，与列车控制程序完全解耦，只用 rednet 的 `loco-door` 协议通信。接线面写在脚本顶部常量里（**不走 config_locomodel.lua**）：
+### 6.1 开车
 
-| 常量 | 默认面 | 作用 |
-| --- | --- | --- |
-| `SIDE_IN_L` | right | 左门脉冲输入（上升沿翻转） |
-| `SIDE_IN_R` | left | 右门脉冲输入 |
-| `SIDE_OUT_L` | front | 左门常电平输出（开门期间为高电平） |
-| `SIDE_OUT_R` | back | 右门常电平输出 |
-| `SIDE_MODEM` | top | 无线 modem（rednet） |
+1. 拉杆扳到前进/后退（主机位）
+2. 手柄从 **EB** 拨到 **N**（此时设定速度取当前实际速度，即 0）
+3. 逐档拨上 `K3` / `K4` 加速，**回到 `C`（13 挡）保持速度**——K 档是"一直变"，不是"定速"
+4. 减速用 `K1` / `K2`，停车用 `B9..B1`（直接制动）或 `EB`
+5. 冒进锁存（`LAT`）后必须把手柄**扳回 EB** 才能解除
 
-**行为**：
+### 6.2 运行时命令
 
-- 任意一台电脑的按钮产生上升沿 → 本车翻转对应门 → 广播 `{kind="cmd", action="open"/"close", only="left"/"right", from=label}` → **全列同步执行**（集控）；`only=nil` 表示两侧一起动。
-- `left`/`right` 是相对车头的 A/B 面：发送方与接收方朝向相反（本车 `mu_config.others[对方].reverse == true`）时自动 `left<->right` 互换，所以同一条命令在每节车开的都是**站台侧**。
-- 每 0.5 s 广播一次 `{kind="state", openL, openR, label}` 供监控/LKJ 读取；状态消息不转发，因此不会形成回环。
-- 电脑 label 建议 `<车号>_door`；脚本对缺少后缀的 label 会自动补 `_door`，查 `mu_config` 朝向时也会去掉后缀再查。
-- ⚠️ `local netUp` 必须声明在 `broadcastState` **之前**（已修复）。Lua 的 local 作用域从声明处开始，声明晚于函数定义时函数里读到的会是全局 `nil`，导致状态广播和心跳全部静默跳过。
-
-**预留**：LKJ 可直接发 `{kind="cmd", action="open", only="right"}`；后续可加 `lock` 动作实现"运行中禁止开门"。
-
----
-
-## 六·五、驾驶台遥显（displayMode）
-
-**用途**：驾驶室空间小，塞不下第二套传感器/转向架外设，但又想让司机在驾驶台看仪表。给驾驶台一台**只读**电脑即可：它只接收主机广播的快照并绘制面板，**不驱动任何东西**。
-
-**硬件**：电脑 + 显示器（`sideMonitor` 那面）+ 无线 modem（`sideModem` 那面）。**不需要**转向架、速度传感器、应力表、手柄、模式拉杆。
-
-**配置**（驾驶台那台的 `config_locomodel.lua`）：
-
-| 键 | 值 | 说明 |
-| --- | --- | --- |
-| `displayMode` | `true` | 本机只当显示器终端，进入显示循环后不再控车 |
-| `displayProtocol` | `nil`（默认） | 默认 `"<mu 协议>-disp"`；手填则**两端必须一致** |
-| `displayInterval` | `0.25` | 主机快照周期（s）；`false` = 主机不发布（省无线流量） |
-| `displayStale` | `2.0` | 超过这么久没收到快照就显示 `LINK LOST` |
-
-驾驶台那台**仍然要拷 `mu_config.lua`**：它只用来取 `protocol` 推出显示频道名，别的字段不读。
-
-**协议与安全**：
-
-- 显示数据走**独立协议** `<mu 协议>-disp`，与控制协议 `loco-mu` 完全分开：
-  - 终端**永远不会**被算成主机（`masters` 计数只看控制协议），所以放几台都不影响"恰好一台主机"的安全检查；
-  - 显示流量**不进入**控制环：控车电脑收到该协议的消息直接丢弃，不解析、不改变任何超时。
-- 只有**主机**发布快照（从机没有设定速度/红灯距离，发出来也没用）。快照含：设定速度、实际速度、驱动应力、制动强度、方向、档位、故障、红灯距离、目视/锁存/待命/空转状态、以及一份编组清单（label + 角色）。
-- 发送端用 `displayInterval` 限流，默认 4 Hz，与车上显示器刷新率一致。
-
-**显示内容**：与车上显示器**同一份绘制代码**（`drawDisplay`），所以布局、颜色、故障横幅永远不会两边不一致。标题是 `<主机 label>  CAB`。
-
-**失效语义**（有意做成"看得见"）：
-
-| 情况 | 面板 |
+| 命令 | 作用 |
 | --- | --- |
-| 快照年龄 > 1 s | 第 7 行红字 `STALE x.xs`（其余字段仍是上次的值） |
-| 超过 `displayStale` 没快照（主机死机/出网络范围/全列无主机） | 红字 `LINK LOST`，速度等字段显示 `--` / `N/A` |
-| 组内主机数 ≠ 1 | 第 8 行 `** FAULT EB **`（主机广播的 `fault` 字段） |
+| `VisualDriving` / `vd` | 开关目视行车：设定速度封顶 36 km/h，且忽略红灯 |
+| `Calibrate` / `calib` | 性能标定（见 6.3） |
+| `Manual` / `man` | 开关手动驾驶台模式，并写盘持久化 |
+| `help` | 列出命令 |
 
-**注意**：终端本身不解锁任何操作——它没有键盘命令，也不接受控制输入。想控车必须把手柄/拉杆接到**主机**那台（两者都是模拟红石量，驾驶台到主机之间可以用 Create 红石链接无线传递，脚本侧无需改动）。**若要在驾驶台真的“开”车**，见下一节：给终端配一台打字机。
+### 6.3 性能标定流程
 
----
+1. **前置**：主机位、停车、有速度传感器、前方 ≥ `calibStartClearance` 无红灯
+2. 手柄拉到 **EB**，输入 `calib`（显示器出现 `ARM`；EB 位再输一次解除）
+3. 手柄拉到 **N** 启动
+4. 程序自动：全牵引爬到顶速（或撞上 `maxSpeed`）→ 惰行 `calibSettle` → 按 `calibBrakeStrength` 制动到停 → 全制动保持到停稳
+5. 结果写本机 `calib.json`（v3）：`accel.a0/a1/vmax`、`brake.d0/d1/mps2/mps2Full`、拟合质量 `rms/r2`、顶速 `topMps`、以及每 2 m/s 的 `profile` 采样表
+6. 重联时从机跟随一起动，测的是**整列**性能
 
-## 六·六、手动驾驶台（linked_typewriter）与警惕键
+冒进防护不需要速度传感器即可工作；标定和空转防护需要。
 
-**用途**：用真实键盘手动驾驶。驾驶台的显示终端旁边放一台 Simulated 的 `simulated:linked_typewriter`，就能把 WASD 变成档位和转向指令，通过独立协议发给主机。
-
-**原理**：打字机会把**绑定过频率**的按键上报给 CC（`key` / `key_up` 事件 + `getPressedKeyCodes()`），终端把它们翻译成
-
-- **档位**（锁存 0..15，和 RHI 手柄**同一套映射**：`0=EB, 1-9=B9..B1, 10=N, 11-15=K1..K4`，13=保持）
-- **转向请求**（-1 左 / 0 直 / +1 右，按住才有效）
-
-然后每秒 5 次广播到 `<mu 协议>-manual`。主机收到后**只是替换“读手柄”这一步**，下游的档位解码、K 段变速、PID、冒进防护、过应力/空转保护全部原样复用。
-
-**按键绑定**（在打字机自己的界面里绑，各绑一个频率即可，**不接接收器也行**；没绑频率的键不会被上报）：
+### 6.4 手动驾驶台操作
 
 | 键 | 作用 |
 | --- | --- |
-| `W` / `S` | 档位 +1 / −1（各一次一格） |
-| `A` / `D` | 按住：向左 / 右选边（`setSteerValueOverride`） |
-| `左Shift`（或右） | 拍 EB（档位归 0） |
-| `Space` | 警惕键（见下） |
+| `W` / `S` | 档位 +1 / −1（一次一格，16 挡与手柄同一套映射） |
+| `A` / `D` | 按住：向左 / 右选边（岔口方向） |
+| `左Shift` | 拍 EB（档位归 0） |
+| `Space` | 警惕确认（若开启了 `vigilanceEnabled`） |
 
-**进入手动模式必须在主机上输入命令 `Manual`（或 `man`）**：驾驶台单独一台绝对抢不走控制权。再输一次退出。
-
-**配置**：
-
-| 键 | 默认 | 说明 |
-| --- | --- | --- |
-| `manualProtocol` | `nil` | 默认 `"<mu 协议>-manual"`；手填则两端一致 |
-| `manualTimeout` | `2.5` | s：主机超过这么久没收到驾驶台包 → **制动**（设定速度默认保留，见下） |
-| `manualHoldSpeedOnLoss` | `true` | 丢包时**保留设定速度**（只制动）；`false` = 连设定速度一起清零（旧行为） |
-| `manualDefault` | `false` | 开机默认是否处于手动模式；**`manual.json` 存在时以文件为准** |
-| `vigilanceEnabled` | `false` | 开启警惕键 |
-| `vigilancePeriod` | `30.0` | s：每隔这么久要按一次 `Space` |
-| `vigilanceGrace` | `15.0` | s：到期前这么久开始**闪烁警告**（`VIG?`） |
-| `vigilanceBrake` | `0.5` | 超时后施加的**常用制动强度**（不是 EB） |
-
-**模式持久化**：`Manual` 是**模式**不是一次性开关。命令切换后会写一份 `manual.json` 到**本机磁盘**（电脑自己的 `/manual.json`），开机时优先级是
-
-```
-manual.json（命令写下的） > manualDefault（配置默认）
-```
-
-所以重启也不会把控制权悄悄交还手柄。三条行为：
-
-- 恢复到手动但**还没收到驾驶台包时保持 EB**（控制台 `MANUAL: mode restored from manual.json`），比落到一个没人握着的物理手柄上安全；
-- 恢复时**没有 modem** → 手动模式被忽略并打印提示（否则永远收不到包、只能靠敲命令脱身），文件保留原值，下次有 modem 时再生效；
-- 想彻底回到手柄：在主机敲一次 `Manual`（会写 `false`）。
-
-**警惕键时序**：距上次按 `Space` 满 `vigilancePeriod - vigilanceGrace` 开始警告 → 满 `vigilancePeriod` 仍未按 → **切牵引 + `vigilanceBrake` 常用制动**，状态锁存，直到驾驶台再按一次 `Space` 解除。
-
-**安全设计（都在主机上，不在驾驶台上）**：
-
-| 情况 | 主机行为 |
-| --- | --- |
-| 驾驶台包超时（遥控器丢了/出范围/断电） | 切牵引 + EB，控制台打印 `MANUAL: no desk packet for 1.2s` |
-| 警惕超时 | 切牵引 + 常用制动（`vigilanceBrake`），锁存到确认 |
-| 冒进防护 / 过应力 / 空转 | **照常生效**，手动模式不是旁路 |
-| 手动模式以外的任何时刻 | 驾驶台消息只被丢弃，不影响控车 |
-
-**显示器**：终端第 7 行显示 `DSK<档位><L/R>`（本台请求），主机会在快照里带 `MAN`、`VIG?`、`VIG!` 标记，两块屏看到的是同一份状态。
-
-**已知限制**：
-
-- 打字机与电脑终端**互斥**：打开任何界面（包括电脑 GUI）时打字机会断开，这是模组行为，不是脚本限制。
-- 方向（前进/后退）仍由**模式拉杆**决定，`A/D` 只管岔口选边——两者别混。
-- 键位绑定顺序由打字机的槽位决定，换键盘/改键要在界面里重绑。
+- 档位是**锁存**的：`C`(13) 保持速度，`K1..K4` 会持续变速
+- **方向仍由模式拉杆决定**，`A/D` 只管岔口选边
+- 打字机与电脑终端**互斥**：打开任何界面（含电脑 GUI）时打字机会断开，这是模组行为
 
 ---
 
-## 七、常见问题速查
+## 七、安全与故障语义
+
+### 7.1 什么情况会切牵引 / 制动
+
+| 情况 | 行为 | 在哪一侧判定 |
+| --- | --- | --- |
+| 组内主机数 ≠ 1 | 全列切牵引 + EB | 每台车自己算 |
+| 从机收不到主机控制数据 > 1.5 s | 切牵引 + EB | 从机 |
+| 发送者状态过期 > 2.5 s | 从 `seen` 剔除（计入主机数判断） | 每台车 |
+| 冒进防护：红灯 ≤ `redEbDistance` | EB 锁存（全制动 + 设定归零），须扳回 EB 解除 | 主机 |
+| 外设调用失败 | 打印一次 `BOGEY CALL FAILED`，保持无输出 | 每台车 |
+| 手动模式：驾驶台包超时 > `manualTimeout` | 切牵引 + 全制动；`manualHoldSpeedOnLoss = true` 时**保留设定速度** | 主机 |
+| 手动模式：警惕超时 | 切牵引 + `vigilanceBrake` 常用制动，锁存到 `Space` 确认 | 主机 |
+| 过应力（有应力表时） | 压低驱动上限，不切牵引 | 每台车 |
+| 空转判定（开启时） | 压低驱动上限，只影响牵引 | 每台车 |
+
+### 7.2 手动模式的持久化规则
+
+`Manual` 是**模式**不是一次性开关，切换后写本机 `manual.json`：
+
+```
+manual.json（命令写下的）  >  manualDefault（配置默认）
+```
+
+- 恢复到手动但**还没收到驾驶台包时保持 EB**（比落到一个没人握着、可能停在驱动挡的物理手柄安全）
+- 恢复时**没有 modem** → 忽略手动并打印提示（否则永远收不到包），文件保留
+- 想彻底回手柄：主机敲一次 `Manual`（写回 `false`），或删本机 `manual.json`
+
+### 7.3 三个协议的隔离保证
+
+| 协议 | 谁发 | 谁听 | 为什么单独开 |
+| --- | --- | --- | --- |
+| `<协议>` | 每台运控车 | 每台运控车 | 控制数据与主机计数 |
+| `<协议>-disp` | 只有主机 | 任何遥显终端 | 终端不能被算成主机；显示流量不进控制环 |
+| `<协议>-manual` | 只有驾驶台 | 运控车 | 驾驶台不能单方面接管；手动台消息不影响自动驾驶 |
+
+控车电脑收到 `-disp` / `-manual` 之外的外来协议只警告一次。
+
+---
+
+## 八、排障
+
+### 8.1 通信与角色
 
 | 症状 | 原因 | 处理 |
 | --- | --- | --- |
-| 从机不自动换向 | mu_config 的 `others` 键写错/复制了主机那份 | 从机那份的键改成**主机的 label**，reverse 按实车朝向 |
-| 收不到对方（无 Heard / RX 不涨） | 组内 protocol 不一致 | 两台 `protocol` 逐字符对比；控制台 `Foreign protocol` 会指出差异 |
-| 全列 EB（FAULT） | 组内主机数 ≠ 1（都中立/多台非中立） | 确认恰好一台拉杆在前进/后退 |
-| 车完全不动（bogey 模式） | ① 变速箱没转速（常亮红石缺失）② 转向架 maxStress 为 0 ③ 外设根本没找到 | ① 变速箱接常亮红石 ② `bogey_probe.lua` 查 `getMaxStress` ③ 控制台 `ERROR: no Simurail_PhysicsBogey peripheral` |
-| 显示器 `T:` 有数值、车却不动或一顿一顿 | 动力网络 overstressed：`getSpeed()` 被清零，牵引力整体为 0 | 接 `Create_Stressometer` 看 `used/capacity`；控制台出现 `STRESS GUARD:` 就是保护在介入，调小 `bogeyDriveMax` 或加大动力产能（多并电机/提高转速） |
-| 显示器 `T:` 无变化 | 驱动应力未变或外设失联 | 控制台 `BOGEY CALL FAILED` 提示；`bogey_probe.lua` 单测 |
-| 倒车被红灯挡住 | 探针轴固定在转向架一端，倒车时朝车尾 | 拉杆 11-15 时保护整体豁免（靠目视）；倒车也要保护得改成按行驶方向选轴 |
-| 驾驶台显示 `LINK LOST` | 主机没发布快照：主机死机 / 无线出范围 / 全列没有主机 / `displayInterval = false` | 看主机控制台有无 `Display terminal started`；核对两台 `mu_config.protocol` 一致；确认有一台在主机位 |
-| 驾驶台显示 `STALE` | 快照变老（主机短暂停顿或链路抖动） | 偶发一两次是链路抖动，持续出现按上一行排查 |
-| 打字机按了没反应 | 该键**没绑频率**（模组只上报绑定过的键）；或打字机不在电脑相邻面/有线网络内 | 在打字机界面里给 W/S/A/D/Shift/Space 各绑一个频率（不用接接收器）；`peripheral.getType()` 应能认出 `linked_typewriter` |
-| 主机提示 `MANUAL: no desk packet` | 驾驶台没在发包：打字机没连、开过电脑界面（打字机会断开）、无线出范围、协议不一致 | 关掉电脑界面再看；核对 `manualProtocol` 两端一致；控制台 `Desk: linked_typewriter on '...'` 是驾驶台侧确认 |
-| 手动模式下按 `W/S` 车没反应 | 主机不在手动模式，或档位停在 `N`（10） | 主机输入 `Manual` 进入手动；档位按到 `K1..K4` 才会加速，按回 `C`(13) 保持 |
-| 显示 `VIG?` 闪烁后切了牵引 | 警惕键超时（`vigilancePeriod` 内没按 `Space`） | 按一次 `Space` 解除；不想用就把 `vigilanceEnabled` 设回 `false` |
-| 手动模式**设定速度突然归零且不回来** | 驾驶台包超时那一拍走进 EB 分支，`rhi_setSpeed` 被清零（`C` 位只冻结、不恢复）。**手柄模式不会有这个问题**，因为手柄是持续电平、不会掉拍 | 默认 `manualHoldSpeedOnLoss = true` 已修掉（丢包只制动、保留设定速度）；`manualTimeout` 已放到 2.5 s；仍复现就看控制台 `SETSPD->0 by ...` 那一行定位 |
-| 控制台出现 `SETSPD->0 by <原因>` | 诊断打印：设定速度从 >0 掉到 0 的那一拍 | `EB(sig=0)`=手柄/档位到 EB；`B-notch`=落到 B 区；`handover/PID`=进档时实际速度为 0（查速度传感器）；`redLatch`=探针误报红灯；`desk-lost`=驾驶台包超时 |
-| 重启后自动进了手动模式 | 上次 `Manual` 命令写下的 `manual.json` 生效了（设计如此） | 不想保留就敲一次 `Manual` 写回 `false`，或直接删本机 `manual.json` |
-| 重启后手动模式没了 | ① 手动模式曾在**没 modem** 的机器上恢复而被忽略 ② `manual.json` 被删/损坏 | 看控制台那两行 `MANUAL:` 提示；文件损坏会静默回落到 `manualDefault` |
-| 前进时保护方向反了（对后方红灯制动 / 前方红灯不动作） | `redProbeFront` 与实际行驶方向相反（纹理方向标识容易看反） | 取反 `redProbeFront`；用 `bogey_probe.lua` 对比两轴 `trackDir` 与行驶方向 |
-| 显示器一直不显示 `R:`（红灯不生效） | 探针距离为 0（模组默认）或信号朝向相反 | 看启动横幅 `Red protection: probe front axle, window ...`；`bogey_probe.lua` 查 `getProbeDistance` 与 `occupiedSignalAligned` |
-| 红灯不触发 EB / 触发太早 | `redEbDistance` 不合适或探针轴不对 | 调 `redEbDistance`（默认 4 格）；用 `bogey_probe.lua` 核对轴与距离 |
-| 想让列车在红灯前自动减速停车 | 按需求已移除接近减速，只保留 4 格内 EB | 后续 LKJ 列控用 `calib.json` 的曲线做目标制动（见规划） |
-| 信号明明红灯却不触发 | 该边界在我们这一侧没装信号方块（`aligned=false` 被忽略），或闭塞分区被**本组**占用 | 该方向补装信号；本组占用按设计不算红灯 |
-| 标定提示 `brake fit invalid` | （已修复）拟合斜率在制动时是**负值**，旧代码却要求 `b > 0`，任何真实制动都通不过 | 更新 `startup.lua`；修复后应看到 `CALIB brake: x.xxx m/s^2` 和 `CALIB: saved to calib.json` |
-| 标定提示 `top speed only X km/h` | 全牵引也爬不到 `calibMinTopSpeed`（牵引力/变速箱转速/制动未释放） | 检查常亮红石、转向架 `getSpeed`、是否有制动残留 |
-| 标定提示 `no stable top speed within 120s` | 速度一直在缓慢爬升，`calibPlateauTime` 内没判定到顶 | 加大 `calibRunTimeout`；或把 `calibPlateauTime` 调小 |
-| 标定提示 `speed rose during the brake run` | 制动没起作用（制动强度被别处覆盖 / 转向架没转速 / 下坡） | 检查常亮红石、转向架 `brakeStrength`；确认标定时手柄在 N 位 |
-| 加速度无力、误差大反而更软 | （已修复）`config_locomodel.lua` 曾有一行重复 `pidKpFar = 2.5` 覆盖 21.3 | 确认文件里只有一处 `pidKpFar`，值 21.3 |
-| B1-B9 无制动 | B 档制动 = (10-sig)/15 强度 | 信号 1→0.6（B1 最强只有 60%）、信号 9→0.067，逐级；全制动请用 EB |
-| 车门能开关但监控看不到门态 | （已修复）`door_ctrl.lua` 的 `local netUp` 声明晚于 `broadcastState` | 确认 `netUp` 声明在函数之前；命令广播不受影响 |
-| 20Hz 下油门高频抖动 | 微分项噪声放大 | pidKd 从 4.3 降到 2~3（0..128 刻度） |
-| 控制台 `BROADCAST FAILED` | 广播失败（少见） | 查看原因，多为 modem 被移除 |
-| 脚本加载报错 | 文件里有中文/非 ASCII | 注释一律英文 |
+| 收不到对方（无 `Heard` / `RX` 不涨） | 组内 `protocol` 不一致 | 两台逐字符对比；控制台 `Foreign protocol` 会指出差异 |
+| 全列 EB（`FAULT`） | 组内主机数 ≠ 1 | 确认恰好一台拉杆在前进/后退位 |
+| 从机不自动换向 | `mu_config.others` 键写错，或复制了主机那份 | 从机那份的键改成**主机 label**，`reverse` 按实车朝向 |
+| 单机也想开，但一直 FAULT | 模式拉杆不在主机位（模拟量落在 5-10） | 拉杆扳到 0-4 或 11-15 |
+
+### 8.2 驱动与制动
+
+| 症状 | 原因 | 处理 |
+| --- | --- | --- |
+| 车完全不动 | ① 变速箱没转速 ② `maxStress` 为 0 ③ 转向架外设没找到 | ① 常亮红石 ② `bogey_probe.lua` 查 `getMaxStress` ③ 看启动横幅 / `ERROR: no Simurail_PhysicsBogey peripheral` |
+| 启动横幅报找不到转向架 | 外设不在贴面/有线网络内，或转向架区块未加载 | 加有线 modem + 网线；确认区块加载 |
+| `T:` 有数值但车不动 / 一顿一顿 | 动力网络 overstressed：`getSpeed()` 被清零，牵引力整体为 0 | 接应力表看 `used/capacity`；控制台 `STRESS GUARD:` 表示保护在介入；调小 `bogeyDriveMax` 或加产能 |
+| `T:` 不变 | 驱动应力未变（缓存生效）或外设失联 | `BOGEY CALL FAILED` 提示；`bogey_probe.lua` 单测 |
+| 加速度无力、误差大反而更软 | 配置里 `pidKpFar` 被重复定义（旧 0..15 刻度残留） | 确认只有一处 `pidKpFar = 21.3` |
+| 20 Hz 下油门高频抖动 | 微分项噪声放大 | `pidKd` 从 4.3 降到 2~3 |
+| B 档几乎不制动 | B 段制动强度 = `(10-sig)/15`：B9=60%，B1≈6.7% | 要更强用 EB；B 段本来就是逐级轻制动 |
+
+### 8.3 冒进防护
+
+| 症状 | 原因 | 处理 |
+| --- | --- | --- |
+| 前方红灯不动作 | 探针窗口为 0（模组默认），或信号在我们这侧没装信号方块（`aligned=false` 被忽略） | 看启动横幅的 `window` 值；`bogey_probe.lua` 查 `getProbeDistance` / `occupiedSignalAligned` |
+| 对后方红灯制动 / 前方红灯漏判 | `redProbeFront` 与行驶方向相反 | 取反 `redProbeFront`；用 `bogey_probe.lua` 对比两轴 `trackDir` 与行驶方向 |
+| 红灯不触发 EB / 触发太早 | `redEbDistance` 不合适 | 调 `redEbDistance`（默认 4 格） |
+| 倒车被红灯挡住 | 探针轴固定，倒车时朝车尾 | 拉杆 11-15 时保护整体豁免（靠目视） |
+| 信号明明是红的却不触发 | 该边界被**本组**占用（按设计不算红灯），或强制红标记不在我们这一侧 | 换到对方的进路或看 `getProbeOccupiedSignalForced` |
+
+### 8.4 遥显终端
+
+| 症状 | 原因 | 处理 |
+| --- | --- | --- |
+| `LINK LOST` | 主机没发布：主机死机 / 无线出范围 / 全列无主机 / `displayInterval = false` | 看主机侧 `Display terminal started`；核对协议一致；确认有一台在主机位 |
+| `STALE x.xs` | 快照变老（主机停顿或链路抖动） | 偶发忽略，持续按上一行查 |
+| 面板有值但看不到 `R:` | 前方无红灯（正常）或探针未启用 | 见 8.3 |
+
+### 8.5 手动驾驶台
+
+| 症状 | 原因 | 处理 |
+| --- | --- | --- |
+| 打字机按了没反应 | 该键**没绑频率**；或打字机不在终端相邻/有线网络内 | 在打字机界面绑频率（不用接接收器）；终端侧应打印 `Desk: linked_typewriter on '...'` |
+| 主机提示 `MANUAL: no desk packet` | 驾驶台没发包：打字机没连、开过电脑界面（会断开）、出范围、协议不一致 | 关界面；核对 `manualProtocol` 两端一致 |
+| 进了手动模式但车不动 | 档位在 `N`(10)，或没按到 `K` 档 | 按 `W` 到 `K1..K4`；到 `C`(13) 保持 |
+| 设定速度突然归零 | 看控制台 `SETSPD->0 by <原因>` | `EB(sig=0)` 档位到 EB；`B-notch` 落到 B 区；`handover/PID` 进档时实际速度为 0（查速度传感器）；`redLatch` 探针误报；`desk-lost` 驾驶台包超时 |
+| 显示 `VIG?` 闪烁后切了牵引 | 警惕超时（`vigilancePeriod` 内没按 `Space`） | 按一次 `Space`；不用就 `vigilanceEnabled = false` |
+| 重启后自动进了手动模式 | `manual.json` 生效（设计如此） | 敲一次 `Manual` 写回 `false`，或删本机 `manual.json` |
+| 重启后手动模式没了 | 恢复时**没有 modem** 被忽略；或 `manual.json` 被删/损坏 | 看 `MANUAL:` 提示；文件损坏会静默回落到 `manualDefault` |
+
+### 8.6 标定
+
+| 提示 | 原因 | 处理 |
+| --- | --- | --- |
+| `top speed only X km/h` | 全牵引也爬不到 `calibMinTopSpeed` | 查常亮红石、转向架 `getSpeed`、是否有制动残留 |
+| `no stable top speed within 120s` | 速度一直缓慢爬升 | 加大 `calibRunTimeout` 或缩小 `calibPlateauTime` |
+| `speed rose during the brake run` | 制动没起作用（被别处覆盖 / 没转速 / 下坡） | 查常亮红石与 `brakeStrength`；标定时手柄要在 N 位 |
+| `brake fit invalid` | 制动样本不足或斜率异常 | 确认制动段真的减速；加大 `calibBrakeTimeout` |
+| 标定中途 `CALIB ABORTED` | 触发冒进锁存 / 过应力保护 / 拉杆离开主机位 | 分别处理：清前方红灯、放宽 `stressGuardMargin`、保持主机位 |
+
+### 8.7 其他
+
+| 症状 | 原因 | 处理 |
+| --- | --- | --- |
+| 脚本加载报错 | 文件里有中文/非 ASCII | 注释一律英文；`tools/lua_balance_check.py` + luaparse 检查 |
+| `BROADCAST FAILED` | 广播失败（少见） | 多为 modem 被移除 |
+| 显示器矮，看不到时钟 | 显示器高度 < 9 | 正常：时钟会挤到第 7 行 |
+
+---
+
+## 九、附录：外设与探针事实
+
+以下均从模组源码核对，改脚本前可直接引用。
+
+### 9.1 用到的外设
+
+| 类型 | 来源 | 用途 |
+| --- | --- | --- |
+| `Simurail_PhysicsBogey` | Simurail | 驱动/制动/换向/转向/探针（唯一输出通道） |
+| `Create_Stressometer` | Create | 过应力保护（可选） |
+| `velocity_sensor` | Simulated | 实际速度（`getVelocity` / `getAdjustedVelocity`） |
+| `linked_typewriter` | Simulated | 手动台按键（`key` / `key_up` 事件、`getPressedKeyCodes`） |
+| 显示器 / 无线 modem | CC:T | 面板与通信 |
+
+无线 modem **不能**访问外设；转向架/传感器/应力表必须是贴面或同一**有线**网络（贴面、有线 modem + 网线都行）。
+
+### 9.2 转向架外设里与本项目相关的调用
+
+```lua
+setMaxStress(±128)                 -- 驱动应力（= 动力网络消耗，符号 = 方向）
+setStressMultiplierOverride(1)     -- 启动时锁定倍率，保证应力 = |maxStress|
+setBrakeStrengthOverride(0..1)     -- 制动强度
+setSteerValueOverride(-1..1)       -- 岔口选边：负 = 左，正 = 右，0 = 尽量取直
+disableSteerValueOverride()        -- 交还给红石/遥控（过岔后必须调用）
+getProbeOccupiedSignalDistance(front)  -- 冒进防护数据源
+setProbeDistance(blocks)           -- 启动时把 redProbeWindow 写入转向架
+```
+
+### 9.3 转向架探针（冒进防护数据源）
+
+| 事实 | 说明 |
+| --- | --- |
+| 扫描长度 | `getProbeDistance()` 是配置项，**默认 0 = 不扫描**；脚本启动时写入 `redProbeWindow` |
+| 刷新频率 | 服务端每 `bogeyProbeInterval` tick 扫一次（默认 5 tick = 0.25 s）；CC 读的是缓存 |
+| 距离单位 | 沿轨道的**弧长（格）**；`-1` = 窗口内无目标 |
+| 轴 | `getProbe*(true)` = 前端轴，`false` = 后端轴；每根轴朝**自己那一端**看，与换向无关 |
+| 只报最近一个 | 窗口内**第一个**符合条件的边界才被记录 |
+| 朝向过滤 | `getProbeOccupiedSignalAligned()` 为 `false` 时脚本忽略（不是给我们看的信号），也因此看不到它后面的信号 |
+| 红灯判定 | 只有当信号被**强制红**或闭塞分区被**别的重联组**占用时才有值（本组占用不算） |
+| 站台 | `getProbeStationDistance/Name/Id/Pos`，`-1`/`nil` 表示无 |
+| 已知瑕疵 | 模组 `reset()` 不清 `stationId`，可能出现距离 −1 但 `stationId` 残留；用前先判 `stationDistance >= 0` |
+
+诊断脚本：`lua bogey_probe.lua`，打印两个轴的完整探针快照与轨道方向向量。
+
+### 9.4 校验工具
+
+```bash
+# 1) 纯 ASCII + Lua 5.1 语法（luaparse 装在游戏外的工作区）
+node <luacheck.js> locos/startup.lua locos/config_locomodel.lua
+
+# 2) 块配平（仓库自带）
+python tools/lua_balance_check.py locos/startup.lua
+
+# 3) mock 回归测试（lupa 提供嵌入式 Lua 5.1，无需进游戏）
+python -m pip install --only-binary :all: lupa
+python tools/sim_display_test.py
+```

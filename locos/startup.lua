@@ -1812,7 +1812,7 @@ end
 
 print("Locomotive program started: " .. locoName)
 print("Max speed: " .. MAX_SPEED .. " m/s | Ctrl+T to stop")
-print("Commands: VisualDriving (vd) | Calibrate (calib) | help")
+print("Commands: VisualDriving (vd) | Calibrate (calib) | Manual (man) | help")
 print(string.format("Red protection: probe %s axle, window %.0f blocks, EB inside %.0f blocks",
     RED_PROBE_FRONT and "front" or "back", RED_WINDOW, RED_EB_DIST))
 
